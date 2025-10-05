@@ -80,28 +80,24 @@ except ImportError:
 
 
 class DQNNetwork(nn.Module):
-    """Enhanced Deep Q-Network - matches the optimized training architecture"""
+    """Enhanced Deep Q-Network"""
     def __init__(self, state_size=3, action_size=2):
         super(DQNNetwork, self).__init__()
         
-        # Enhanced architecture with layer normalization and dropout
         self.network = nn.Sequential(
             nn.Linear(state_size, 128),
-            nn.LayerNorm(128),  # Layer normalization for stability
+            nn.LayerNorm(128),
             nn.ReLU(),
-            nn.Dropout(0.1),    # Light dropout for regularization
+            nn.Dropout(0.1),
             nn.Linear(128, 64),
             nn.LayerNorm(64),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(64, action_size)
         )
-        
-        # Better weight initialization
         self._init_weights()
     
     def _init_weights(self):
-        """Improved initialization for stable training"""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
@@ -112,7 +108,7 @@ class DQNNetwork(nn.Module):
 
 
 class BlackjackAgent_DQN:
-    """Enhanced DQN Agent for blackjack gameplay - matches optimized training model"""
+    """DQN Agent for blackjack"""
     def __init__(self, model_path=None):
         self.state_size = 3
         self.action_size = 2
@@ -122,11 +118,10 @@ class BlackjackAgent_DQN:
             self.load_model(model_path)
         
     def state_to_tensor(self, state):
-        """Convert Blackjack state to normalized tensor - matches training normalization"""
-        # Apply same normalization as training model
-        player_sum = (state[0] - 12) / 9.0      # Normalize to roughly [-1, 1]
-        dealer_card = (state[1] - 6) / 5.0      # Normalize to roughly [-1, 1] 
-        usable_ace = float(state[2])            # Already 0 or 1
+        """Convert state to normalized tensor"""
+        player_sum = (state[0] - 12) / 9.0
+        dealer_card = (state[1] - 6) / 5.0
+        usable_ace = float(state[2])
         
         return torch.tensor([player_sum, dealer_card, usable_ace], dtype=torch.float32).unsqueeze(0)
     
@@ -140,23 +135,19 @@ class BlackjackAgent_DQN:
     def load_model(self, model_path):
         """Load trained model - handles both old and new checkpoint formats"""
         try:
-            checkpoint = torch.load(model_path, map_location='cpu')
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             
             # Handle new checkpoint format (with full training state)
             if isinstance(checkpoint, dict) and 'q_network_state_dict' in checkpoint:
                 self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
-                print(f"✅ Enhanced DQN model loaded from {model_path}")
-                if 'training_history' in checkpoint:
-                    print(f"📊 Training history available (episodes: {len(checkpoint['training_history'].get('rewards', []))})")
             # Handle old format (direct state dict)
             else:
                 self.q_network.load_state_dict(checkpoint)
-                print(f"✅ DQN model loaded from {model_path} (legacy format)")
                 
             self.q_network.eval()
+            print(f"✅ DQN model loaded successfully")
         except Exception as e:
             print(f"❌ Error loading DQN model: {e}")
-            print(f"💡 Make sure the model was saved with the enhanced architecture!")
     
     def save_model(self, model_path):
         """Save trained model"""
@@ -174,32 +165,25 @@ class BlackjackAgent_ActorCritic:
     def get_action(self, state, training=False):
         """Get action from Actor-Critic model"""
         if self.model is None:
-            return np.random.choice(2)  # Random if no model loaded
+            return np.random.choice(2)
         
         try:
-            # Convert state to tensor format expected by Actor-Critic
             state_tensor = torch.tensor([state[0], state[1], int(state[2])], 
                                       dtype=torch.float32).unsqueeze(0)
             
             with torch.no_grad():
                 action_probs = self.model(state_tensor)
-                if hasattr(action_probs, 'probs'):
-                    action = action_probs.sample().item()
-                else:
-                    action = torch.multinomial(action_probs, 1).item()
-                return action
+                return torch.argmax(action_probs).item()
         except Exception as e:
-            print(f"❌ Error in Actor-Critic inference: {e}")
             return np.random.choice(2)
     
     def load_model(self, model_path):
         """Load Actor-Critic model"""
         try:
-            self.model = torch.load(model_path, map_location='cpu')
+            self.model = torch.load(model_path, map_location='cpu', weights_only=False)
             self.model.eval()
-            print(f"✅ Actor-Critic model loaded from {model_path}")
         except Exception as e:
-            print(f"❌ Error loading Actor-Critic model: {e}")
+            print(f"Error loading Actor-Critic model: {e}")
     
     def save_model(self, model_path):
         """Save Actor-Critic model"""
@@ -248,7 +232,7 @@ class BlackjackAgent_TDSearch:
                 with open(model_path, 'rb') as f:
                     self.model_data = pickle.load(f)
             elif model_path.endswith('.pth') or model_path.endswith('.pt'):
-                self.model_data = torch.load(model_path, map_location='cpu')
+                self.model_data = torch.load(model_path, map_location='cpu', weights_only=False)
                 if hasattr(self.model_data, 'eval'):
                     self.model_data.eval()
             else:
@@ -256,7 +240,7 @@ class BlackjackAgent_TDSearch:
                     with open(model_path, 'rb') as f:
                         self.model_data = pickle.load(f)
                 except:
-                    self.model_data = torch.load(model_path, map_location='cpu')
+                    self.model_data = torch.load(model_path, map_location='cpu', weights_only=False)
                     if hasattr(self.model_data, 'eval'):
                         self.model_data.eval()
             
@@ -311,12 +295,21 @@ class GUIBlackjackGame:
         self.setup_gui()
     
     def _is_natural_blackjack(self, state, is_first_hand=True):
-        """Check if current state is a natural blackjack (21 with first 2 cards)"""
+        """Check if state is natural blackjack (21 with first 2 cards)"""
         player_sum = state[0]
         usable_ace = state[2]
         
-        # Natural blackjack: sum is 21 AND we have a usable ace (indicating Ace + 10-value card)
         return is_first_hand and player_sum == 21 and usable_ace
+    
+    def _is_natural_blackjack_from_cards(self, cards):
+        """Check if hand is natural blackjack (Ace + 10-value card)"""
+        if len(cards) != 2:
+            return False
+        
+        has_ace = 1 in cards
+        has_ten = any(card == 10 for card in cards)
+        
+        return has_ace and has_ten
     
     def setup_gui(self):
         """Setup the GUI elements using modern components"""
@@ -326,30 +319,24 @@ class GUIBlackjackGame:
             self._setup_basic_gui()
     
     def _setup_modern_gui(self):
-        """Setup modern GUI using ui_components"""
-        # Title
+        """Setup modern GUI"""
         title_label = tk.Label(self.root, text="🎯 Human vs AI Blackjack", 
                               font=("Segoe UI", 18, "bold"),
                               fg=ModernColors.WHITE, bg=ModernColors.MAIN_BG)
         title_label.pack(pady=10)
         
-        # Dealer section
         self.dealer_section = PlayerSection(self.root, "🎰 DEALER", player_type="dealer")
         self.dealer_section.pack(fill=tk.X, padx=15, pady=8)
         
-        # Human section
         self.human_section = PlayerSection(self.root, "👤 HUMAN PLAYER", player_type="human")
         self.human_section.pack(fill=tk.X, padx=15, pady=8)
         
-        # Agents container - side by side for multiple agents
         agents_frame = tk.Frame(self.root, bg=ModernColors.MAIN_BG)
         agents_frame.pack(fill=tk.X, padx=15, pady=8)
         
-        # Create agent sections
         self.agent_sections = {}
         for agent_name in self.agents.keys():
             display_name = AGENT_CONFIGS.get(agent_name, {}).get('display_name', f"🤖 {agent_name.upper()}")
-            # Remove emoji if present to avoid duplication
             clean_name = display_name.replace("🧠 ", "").replace("🎭 ", "").replace("🔍 ", "").replace("📊 ", "")
             
             agent_section = PlayerSection(agents_frame, f"🤖 {clean_name}", 
@@ -357,7 +344,6 @@ class GUIBlackjackGame:
             agent_section.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
             self.agent_sections[agent_name] = agent_section
         
-        # Action buttons
         button_frame = tk.Frame(self.root, bg=ModernColors.MAIN_BG)
         button_frame.pack(pady=15)
         
@@ -373,11 +359,9 @@ class GUIBlackjackGame:
                                            button_type="new")
         self.new_game_button.pack(side=tk.LEFT, padx=8)
         
-        # Win Rate Chart
         self.chart = WinRateChart(self.root)
         self.chart.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
         
-        # Initialize win tracking
         self.win_history = {"Human": [], "Games": []}
         for agent_name in self.agents.keys():
             display_name = AGENT_CONFIGS.get(agent_name, {}).get('display_name', f"🤖 {agent_name.upper()}")
@@ -792,16 +776,21 @@ class GUIBlackjackGame:
             section = self.agent_sections[agent_name]
             if sum_val is not None:
                 section.update_sum(sum_val)
-            if status is not None:
+            if status is not None and result is None:
                 section.update_status(status)
             if result is not None:
-                section.update_status("", result)
+                # Ensure result is properly converted to int for comparison
+                result = int(result)
+                # Use update_status with reward parameter
+                section.update_status("", reward=result)
         else:
             if agent_name in self.agent_sum_labels and sum_val is not None:
                 self.agent_sum_labels[agent_name].config(text=f"Sum: {sum_val}")
             if agent_name in self.agent_status_labels and status is not None:
                 self.agent_status_labels[agent_name].config(text=status)
             if agent_name in self.agent_result_labels and result is not None:
+                # Ensure proper int comparison
+                result = int(result)
                 result_text = "WIN" if result == 1 else "LOSE" if result == -1 else "DRAW"
                 self.agent_result_labels[agent_name].config(text=result_text)
 
@@ -841,7 +830,8 @@ class GUIBlackjackGame:
                                              sum_val=state[0])
                     
                     if self.agent_done[agent_name]:
-                        self.agent_rewards[agent_name] = reward
+                        # Store reward (will be recalculated in _finish_game for consistency)
+                        self.agent_rewards[agent_name] = int(reward)
                         self._update_agent_display(agent_name, status="Finished")
                         self.current_agent_index += 1
                     
@@ -886,21 +876,66 @@ class GUIBlackjackGame:
                 self._update_dealer_display(final_sum="(didn't complete)")
         except Exception as e:
             self._update_dealer_display(final_sum="Unknown")
+            dealer_sum = 0
+            dealer_cards = []
         
-        # Update scores
+        dealer_has_natural = self._is_natural_blackjack_from_cards(dealer_cards) if dealer_cards else False
+        human_cards = list(self.human_env.unwrapped.player)
+        human_has_natural = self._is_natural_blackjack_from_cards(human_cards)
+        
+        human_sum = self.human_state[0]
+        if human_sum > 21:
+            human_reward = -1
+        elif dealer_sum > 21:
+            human_reward = 1
+        elif human_sum == 21 and dealer_sum == 21:
+            if human_has_natural and not dealer_has_natural:
+                human_reward = 1
+            elif dealer_has_natural and not human_has_natural:
+                human_reward = -1
+            else:
+                human_reward = 0
+        elif human_sum > dealer_sum:
+            human_reward = 1
+        elif human_sum < dealer_sum:
+            human_reward = -1
+        else:
+            human_reward = 0
+        corrected_agent_rewards = {}
+        for agent_name in agent_rewards.keys():
+            agent_sum = self.agent_states[agent_name][0]
+            agent_cards = list(self.agent_envs[agent_name].unwrapped.player)
+            agent_has_natural = self._is_natural_blackjack_from_cards(agent_cards)
+            
+            if agent_sum > 21:
+                corrected_agent_rewards[agent_name] = -1
+            elif dealer_sum > 21:
+                corrected_agent_rewards[agent_name] = 1
+            elif agent_sum == 21 and dealer_sum == 21:
+                if agent_has_natural and not dealer_has_natural:
+                    corrected_agent_rewards[agent_name] = 1
+                elif dealer_has_natural and not agent_has_natural:
+                    corrected_agent_rewards[agent_name] = -1
+                else:
+                    corrected_agent_rewards[agent_name] = 0
+            elif agent_sum > dealer_sum:
+                corrected_agent_rewards[agent_name] = 1
+            elif agent_sum < dealer_sum:
+                corrected_agent_rewards[agent_name] = -1
+            else:
+                corrected_agent_rewards[agent_name] = 0
+        
         if human_reward == 1:
             self.human_wins += 1
         elif human_reward == -1:
             self.human_losses += 1
         else:
             self.human_draws += 1
-            
-        # Update human display
+        
         self._update_human_record()
         self._update_human_display(result=human_reward)
-            
-        # Update agent scores and displays
-        for agent_name, reward in agent_rewards.items():
+        
+        for agent_name, reward in corrected_agent_rewards.items():
             if reward == 1:
                 self.agent_stats[agent_name]['wins'] += 1
             elif reward == -1:
@@ -908,7 +943,6 @@ class GUIBlackjackGame:
             else:
                 self.agent_stats[agent_name]['draws'] += 1
             
-            # Update agent display
             if UI_COMPONENTS_AVAILABLE and hasattr(self, 'agent_sections') and agent_name in self.agent_sections:
                 stats = self.agent_stats[agent_name]
                 self.agent_sections[agent_name].update_record(stats['wins'], stats['losses'], stats['draws'])
@@ -1015,38 +1049,29 @@ def load_agents_from_config():
             
         model_path = config['model_path']
         if not model_path or not os.path.exists(model_path):
-            print(f"⚠️  Skipping {agent_type}: Model file not found or path not set")
             continue
         
         try:
             agent = load_agent(agent_type, model_path)
             agents[agent_type] = agent
-            print(f"✅ Loaded {config['display_name']} from {model_path}")
         except Exception as e:
-            print(f"❌ Error loading {agent_type} agent: {e}")
+            print(f"Error loading {agent_type}: {e}")
     
     return agents
 
 
 def main():
     """Main function"""
-    print("🎯 Human vs Multi-AI Blackjack Game")
-    print("=" * 50)
-    
     if not GUI_AVAILABLE:
-        print("❌ GUI not available! Please install tkinter.")
+        print("GUI not available! Please install tkinter.")
         sys.exit(1)
     
     agents = load_agents_from_config()
     
     if not agents:
-        print("❌ No agents loaded! Please check your AGENT_CONFIGS.")
-        print("Make sure at least one agent is enabled and has a valid model path.")
+        print("No agents loaded! Check AGENT_CONFIGS.")
         sys.exit(1)
     
-    print(f"\n🤖 Loaded {len(agents)} agent(s): {', '.join([AGENT_CONFIGS[name]['display_name'] for name in agents.keys()])}")
-    
-    print("🖥️  Starting GUI mode...")
     game = GUIBlackjackGame(agents)
     game.run()
 
