@@ -37,7 +37,15 @@ AGENT_CONFIGS = {
         "enabled": False,  # Enable if you have a Q-table model
         "model_path": "qtable_agent.pkl",  # Use proper Q-table path
         "display_name": "Q-Table Agent"
-    }
+    },
+
+    # Basic Strategy (Optimal Policy) Agent
+    "basic_strategy": {
+        "enabled": True,  # Enable it
+        "model_path": None,  # No model file needed
+        "display_name": "Basic Strategy Agent"
+    },
+
 }
 
 import pickle
@@ -256,6 +264,19 @@ class BlackjackAgent_TDSearch:
                     pickle.dump(self.model_data, f)
             else:
                 torch.save(self.model_data, model_path)
+
+class BlackjackAgent_BasicStrategy:
+    """Rule-based Basic Strategy Agent (Optimal policy for single-deck S17)"""
+    def __init__(self, model_path=None):
+        pass  # No model needed
+
+    def get_action(self, state, training=False):
+        """
+        Map environment state (player_sum, dealer_upcard, usable_ace)
+        to deterministic action using your basic_strategy_action function.
+        """
+        from basic_strategy_bot import basic_strategy_action
+        return basic_strategy_action(state)
 
 
 class GUIBlackjackGame:
@@ -1029,7 +1050,9 @@ def load_agent(agent_type, model_path):
         'actor_critic': BlackjackAgent_ActorCritic,
         'ac': BlackjackAgent_ActorCritic,
         'td_search': BlackjackAgent_TDSearch,
-        'tds': BlackjackAgent_TDSearch
+        'tds': BlackjackAgent_TDSearch,
+        'basic_strategy': BlackjackAgent_BasicStrategy,
+        'bs': BlackjackAgent_BasicStrategy
     }
     
     agent_class = agent_map.get(agent_type.lower())
@@ -1038,7 +1061,6 @@ def load_agent(agent_type, model_path):
     
     return agent_class(model_path)
 
-
 def load_agents_from_config():
     """Load agents based on the configuration"""
     agents = {}
@@ -1046,9 +1068,18 @@ def load_agents_from_config():
     for agent_type, config in AGENT_CONFIGS.items():
         if not config['enabled']:
             continue
-            
-        model_path = config['model_path']
-        if not model_path or not os.path.exists(model_path):
+
+        model_path = config.get('model_path')
+
+        # Allow agents that don't need a file (like basic_strategy)
+        if model_path is None:
+            agent = load_agent(agent_type, model_path)
+            agents[agent_type] = agent
+            print(f"✅ {config['display_name']} loaded (no model file required)")
+            continue
+
+        if not os.path.exists(model_path):
+            print(f"⚠️ Model file not found for {agent_type}: {model_path}")
             continue
         
         try:
