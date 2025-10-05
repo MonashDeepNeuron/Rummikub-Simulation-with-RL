@@ -51,7 +51,7 @@ class MazeEnv(gym.Env):
         # convert dict observation into a simple tuple for indexing Q-table
         return tuple(self._agent_location.tolist() + self._target_location.tolist())
 
-    def reset(self, seed = None, options = None):
+    def reset(self, seed = None, options = None): # random map reset
         super().reset(seed=seed)
 
         self._agent_location = self.np_random.integers(0, self.size, size=2, dtype=int)
@@ -66,7 +66,7 @@ class MazeEnv(gym.Env):
         info = self._get_info()
         return observation, info
 
-    # def reset(self, seed=None, options=None):
+    # def reset(self, seed=None, options=None): # default map reset
     #     super().reset(seed=seed)
     #     self._agent_location = np.array([0, 0])             # always bottom-left
     #     self._target_location = np.array([self.size-1, self.size-1])  # always top-right
@@ -233,12 +233,18 @@ if __name__ == "__main__":
     plt.title("Q-learning: Rewards per Episode")
     plt.show()
 
-    obs, info = env.reset()
-    state = env._get_state()
-    done = False
-
-    while not done:
-        action = np.argmax(get_Q(state))  # greedy policy
-        obs, reward, done, truncated, info = env.step(action)
-        env.render()
+    # continues to play the game after training
+    while True:
+        obs, info = env.reset()
         state = env._get_state()
+        done = False
+
+        while not done:
+            action = np.argmax(get_Q(state))  # greedy policy
+            obs, reward, done, truncated, info = env.step(action)
+            env.render()
+            state = env._get_state()
+
+            # small delay so the movement is visible
+            pygame.time.wait(200)
+
