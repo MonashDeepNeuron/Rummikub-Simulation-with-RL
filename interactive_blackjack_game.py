@@ -19,7 +19,7 @@ AGENT_CONFIGS = {
     
     # Actor-Critic Agent Configuration
     "actor_critic": {
-        "enabled": True,  # Disabled until you have a proper Actor-Critic model
+        "enabled": False,  # Disabled until you have a proper Actor-Critic model
         "model_path": "dqn_agent.pth",
         # "model_path": "actor_critic_agent.pth",  # Use proper AC model path
         "display_name": "Actor-Critic Agent"
@@ -27,7 +27,7 @@ AGENT_CONFIGS = {
     
     # Temporal Difference Search Agent Configuration
     "td_search": {
-        "enabled": False,  # Disabled until you have a proper TD Search model
+        "enabled": True,  # Disabled until you have a proper TD Search model
         "model_path": "td_search_agent.pth",  # Use proper TD model path
         "display_name": "TD Search Agent"
     },
