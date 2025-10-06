@@ -19,9 +19,8 @@ AGENT_CONFIGS = {
     
     # Actor-Critic Agent Configuration
     "actor_critic": {
-        "enabled": False,  # Disabled until you have a proper Actor-Critic model
-        "model_path": "dqn_agent.pth",
-        # "model_path": "actor_critic_agent.pth",  # Use proper AC model path
+        "enabled": True,  # Now enabled with correct model path
+        "model_path": "actor_critic_agent.pth",
         "display_name": "Actor-Critic Agent"
     },
     
@@ -34,8 +33,8 @@ AGENT_CONFIGS = {
     
     # Q-Table Agent Configuration
     "qtable": {
-        "enabled": False,  # Enable if you have a Q-table model
-        "model_path": "qtable_agent.pkl",  # Use proper Q-table path
+        "enabled": True,  # Now enabled with correct model path
+        "model_path": "qtable_agent.pth",
         "display_name": "Q-Table Agent"
     },
 
@@ -165,38 +164,55 @@ class BlackjackAgent_DQN:
 class BlackjackAgent_ActorCritic:
     """Actor-Critic Agent for loading and inference"""
     def __init__(self, model_path=None):
-        self.model = None
+        # Initialize actor network (same architecture as in training)
+        obs_size = 3
+        action_size = 2
+        self.actor = nn.Sequential(
+            nn.Linear(obs_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_size),
+            nn.Softmax(dim=-1)
+        )
         
         if model_path and os.path.exists(model_path):
             self.load_model(model_path)
     
     def get_action(self, state, training=False):
         """Get action from Actor-Critic model"""
-        if self.model is None:
-            return np.random.choice(2)
-        
         try:
             state_tensor = torch.tensor([state[0], state[1], int(state[2])], 
                                       dtype=torch.float32).unsqueeze(0)
             
             with torch.no_grad():
-                action_probs = self.model(state_tensor)
+                action_probs = self.actor(state_tensor).squeeze(0)
+                # Greedy action selection
                 return torch.argmax(action_probs).item()
         except Exception as e:
+            print(f"❌ Error in Actor-Critic inference: {e}")
             return np.random.choice(2)
     
     def load_model(self, model_path):
-        """Load Actor-Critic model"""
+        """Load Actor-Critic model from checkpoint"""
         try:
-            self.model = torch.load(model_path, map_location='cpu', weights_only=False)
-            self.model.eval()
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+            
+            # Handle checkpoint dictionary format
+            if isinstance(checkpoint, dict) and 'actor_state_dict' in checkpoint:
+                self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            else:
+                # Fallback for direct model save
+                self.actor.load_state_dict(checkpoint)
+            
+            self.actor.eval()
+            print(f"✅ Actor-Critic model loaded successfully")
         except Exception as e:
-            print(f"Error loading Actor-Critic model: {e}")
+            print(f"❌ Error loading Actor-Critic model: {e}")
     
     def save_model(self, model_path):
         """Save Actor-Critic model"""
-        if self.model:
-            torch.save(self.model, model_path)
+        torch.save(self.actor.state_dict(), model_path)
 
 
 class BlackjackAgent_TDSearch:
@@ -264,6 +280,67 @@ class BlackjackAgent_TDSearch:
                     pickle.dump(self.model_data, f)
             else:
                 torch.save(self.model_data, model_path)
+
+class BlackjackAgent_QTable:
+    """Q-Table Agent for loading and inference"""
+    def __init__(self, model_path=None):
+        self.q_table = None
+        
+        if model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+    
+    def get_action(self, state, training=False):
+        """Get action from Q-table"""
+        if self.q_table is None:
+            return np.random.choice(2)
+        
+        try:
+            # Q-table uses state as key
+            if state in self.q_table:
+                return np.argmax(self.q_table[state])
+            else:
+                # If state not in table, return random action
+                return np.random.choice(2)
+        except Exception as e:
+            print(f"❌ Error in Q-Table inference: {e}")
+            return np.random.choice(2)
+    
+    def load_model(self, model_path):
+        """Load Q-table model"""
+        try:
+            if model_path.endswith('.pkl'):
+                with open(model_path, 'rb') as f:
+                    data = pickle.load(f)
+            elif model_path.endswith('.pth') or model_path.endswith('.pt'):
+                data = torch.load(model_path, map_location='cpu', weights_only=False)
+            else:
+                # Try pickle first, then torch
+                try:
+                    with open(model_path, 'rb') as f:
+                        data = pickle.load(f)
+                except:
+                    data = torch.load(model_path, map_location='cpu', weights_only=False)
+            
+            # Handle checkpoint dictionary format (contains 'Q' key)
+            if isinstance(data, dict) and 'Q' in data:
+                self.q_table = data['Q']
+            else:
+                # Direct Q-table save
+                self.q_table = data
+            
+            print(f"✅ Q-Table model loaded from {model_path}")
+        except Exception as e:
+            print(f"❌ Error loading Q-Table model: {e}")
+    
+    def save_model(self, model_path):
+        """Save Q-table model"""
+        if self.q_table:
+            if model_path.endswith('.pkl'):
+                with open(model_path, 'wb') as f:
+                    pickle.dump(self.q_table, f)
+            else:
+                torch.save(self.q_table, model_path)
+
 
 class BlackjackAgent_BasicStrategy:
     """Rule-based Basic Strategy Agent (Optimal policy for single-deck S17)"""
@@ -383,10 +460,11 @@ class GUIBlackjackGame:
         self.chart = WinRateChart(self.root)
         self.chart.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
         
-        self.win_history = {"Human": [], "Games": []}
+        self.win_history = {"Human": [], "Human_losses": [], "Games": []}
         for agent_name in self.agents.keys():
             display_name = AGENT_CONFIGS.get(agent_name, {}).get('display_name', f"🤖 {agent_name.upper()}")
             self.win_history[display_name] = []
+            self.win_history[f"{display_name}_losses"] = []
     
     def _setup_basic_gui(self):
         """Fallback basic GUI setup if ui_components not available"""
@@ -523,10 +601,11 @@ class GUIBlackjackGame:
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         
         # Initialize win tracking
-        self.win_history = {"Human": [], "Games": []}
+        self.win_history = {"Human": [], "Human_losses": [], "Games": []}
         for agent_name in self.agents.keys():
             display_name = AGENT_CONFIGS.get(agent_name, {}).get('display_name', f"🤖 {agent_name.upper()}")
             self.win_history[display_name] = []
+            self.win_history[f"{display_name}_losses"] = []
     
     def update_graph(self):
         """Update the win rate graph"""
@@ -538,6 +617,14 @@ class GUIBlackjackGame:
             self.ax.set_xlabel("Game Number")
             self.ax.set_ylabel("Cumulative Wins")
             self.ax.grid(True, alpha=0.3)
+            
+            # Add theoretical win probability reference line (42% of total games played)
+            if len(self.win_history.get("Games", [])) > 0:
+                max_games = max(self.win_history["Games"])
+                theoretical_wins = [g * 0.42 for g in self.win_history["Games"]]
+                self.ax.plot(self.win_history["Games"], theoretical_wins, 
+                           color='gray', linestyle='--', linewidth=1.5, alpha=0.7, 
+                           label='Theoretical (42%)')
             
             if len(self.win_history["Games"]) > 0:
                 # Define colors for up to 7 entities (Human, Dealer, 5 agents)
@@ -856,10 +943,10 @@ class GUIBlackjackGame:
                         self._update_agent_display(agent_name, status="Finished")
                         self.current_agent_index += 1
                     
-                    self.root.after(800, next_agent_step)
+                    self.root.after(400, next_agent_step)  # Reduced from 800ms to 400ms
                 else:
                     self.current_agent_index += 1
-                    self.root.after(100, next_agent_step)
+                    self.root.after(50, next_agent_step)  # Reduced from 100ms to 50ms
             else:
                 # All agents finished
                 self._finish_game(human_reward, self.agent_rewards)
@@ -973,12 +1060,16 @@ class GUIBlackjackGame:
         # Update win history for graph
         self.win_history["Games"].append(self.games_played)
         self.win_history["Human"].append(self.human_wins)
+        self.win_history["Human_losses"].append(self.human_losses)
         
         for agent_name in self.agents.keys():
             display_name = AGENT_CONFIGS.get(agent_name, {}).get('display_name', f"🤖 {agent_name.upper()}")
             if display_name not in self.win_history:
                 self.win_history[display_name] = []
+            if f"{display_name}_losses" not in self.win_history:
+                self.win_history[f"{display_name}_losses"] = []
             self.win_history[display_name].append(self.agent_stats[agent_name]['wins'])
+            self.win_history[f"{display_name}_losses"].append(self.agent_stats[agent_name]['losses'])
         
         # Update graph
         self.update_graph()
@@ -1051,6 +1142,8 @@ def load_agent(agent_type, model_path):
         'ac': BlackjackAgent_ActorCritic,
         'td_search': BlackjackAgent_TDSearch,
         'tds': BlackjackAgent_TDSearch,
+        'qtable': BlackjackAgent_QTable,
+        'q_table': BlackjackAgent_QTable,
         'basic_strategy': BlackjackAgent_BasicStrategy,
         'bs': BlackjackAgent_BasicStrategy
     }

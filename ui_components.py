@@ -357,14 +357,8 @@ class WinRateChart(tk.Frame):
                     font=("Segoe UI", 10), bg=ModernColors.WHITE).pack(pady=10)
             return
         
-        # Title
-        title = tk.Label(self, text="Game Statistics Over Time",
-                        font=("Segoe UI", 12, "bold"),
-                        fg=ModernColors.DARK, bg=ModernColors.WHITE)
-        title.pack(pady=5)
-        
-        # Create matplotlib figure with two subplots side by side
-        self.fig = Figure(figsize=(12, 3.5), dpi=100)
+        # Create matplotlib figure with two subplots side by side (no title, more vertical space)
+        self.fig = Figure(figsize=(12, 4.0), dpi=100)
         
         # Left subplot - Cumulative Wins
         self.ax1 = self.fig.add_subplot(121)
@@ -383,9 +377,9 @@ class WinRateChart(tk.Frame):
         self.ax2.tick_params(labelsize=8)
         self.ax2.grid(True, alpha=0.3)
         self.ax2.set_facecolor('#f9fafb')
-        self.ax2.set_ylim(0, 105)  # Add 5% spacing at top
+        self.ax2.set_ylim(20, 70)  # Focus on 20%-70% range for better visibility
         
-        self.fig.tight_layout(pad=1.0)
+        self.fig.tight_layout(pad=1.5, rect=[0, 0.02, 1, 1])  # Add bottom margin to prevent x-label cutoff
         
         # Canvas
         self.canvas = FigureCanvasTkAgg(self.fig, self)
@@ -414,7 +408,10 @@ class WinRateChart(tk.Frame):
         self.ax2.tick_params(labelsize=8)
         self.ax2.grid(True, alpha=0.3)
         self.ax2.set_facecolor('#f9fafb')
-        self.ax2.set_ylim(0, 105)  # Add 5% spacing at top
+        self.ax2.set_ylim(20, 70)  # Focus on 20%-70% range for better visibility
+        
+        # Add theoretical win probability line at 42%
+        self.ax2.axhline(y=42, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='Theoretical (42%)')
         
         if "Games" not in win_history or len(win_history["Games"]) == 0:
             self.fig.tight_layout(pad=1.0)
@@ -440,9 +437,9 @@ class WinRateChart(tk.Frame):
                          markersize=5, label="Human", color=color, alpha=0.9)
             plot_index += 1
         
-        # Plot Agents with offsets
+        # Plot Agents with offsets (skip _losses entries)
         for player, wins in win_history.items():
-            if player in ["Games", "Human"]:
+            if player in ["Games", "Human"] or "_losses" in player:
                 continue
             
             percentages = [(w / g * 100) if g > 0 else 0 for w, g in zip(wins, games)]
@@ -456,23 +453,25 @@ class WinRateChart(tk.Frame):
                          markersize=5, label=player, color=color, alpha=0.9)
             plot_index += 1
         
-        # Calculate and plot dealer win percentage (when human/agents lose)
+        # Calculate and plot dealer win percentage (only from actual losses, excluding draws)
         if len(games) > 0:
             dealer_percentages = []
             for i, game_num in enumerate(games):
-                total_losses = 0
+                total_dealer_wins = 0  # This is the sum of all player losses
                 total_players = 0
                 for player, wins in win_history.items():
-                    if player == "Games":
+                    if player == "Games" or "_losses" in player:
                         continue
-                    # Each player's losses in this game = total games played - their wins
-                    player_losses = game_num - wins[i]
-                    total_losses += player_losses
-                    total_players += 1
+                    # Get the losses for this player (dealer wins against this player)
+                    losses_key = f"{player}_losses"
+                    if losses_key in win_history and i < len(win_history[losses_key]):
+                        total_dealer_wins += win_history[losses_key][i]
+                        total_players += 1
                 
                 if total_players > 0 and game_num > 0:
-                    # Dealer win percentage = total losses / (total players * games played)
-                    dealer_win_percentage = (total_losses / (total_players * game_num)) * 100
+                    # Dealer win percentage = total dealer wins / (total players * games played)
+                    # This now correctly excludes draws
+                    dealer_win_percentage = (total_dealer_wins / (total_players * game_num)) * 100
                 else:
                     dealer_win_percentage = 0
                     
@@ -485,6 +484,9 @@ class WinRateChart(tk.Frame):
                 self.ax2.plot(offset_games_2, dealer_percentages, marker='^', linewidth=1.8, 
                              markersize=5, label="Dealer", color=color, alpha=0.9)
         
+        # Add theoretical dealer win probability line at 49%
+        self.ax2.axhline(y=49, color='darkred', linestyle='--', linewidth=1.5, alpha=0.7, label='Dealer Theoretical (49%)')
+        
         # Add legends
         self.ax1.legend(loc='upper left', fontsize=7)
         self.ax2.legend(loc='upper left', fontsize=7)
@@ -494,7 +496,7 @@ class WinRateChart(tk.Frame):
             self.ax1.set_xlim(0, max(games) + 1)
             self.ax2.set_xlim(0, max(games) + 1)
         
-        self.fig.tight_layout(pad=1.0)
+        self.fig.tight_layout(pad=0.5, rect=[0, 0.02, 1, 1])  # Add bottom margin to prevent x-label cutoff
         self.canvas.draw()
 
 
