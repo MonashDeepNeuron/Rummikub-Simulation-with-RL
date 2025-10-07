@@ -36,7 +36,7 @@ class MazeEnv(gym.Env):
     def _get_obs(self):
         return {
             "agent": self._agent_location,
-            "target": self._target_location
+            "goal": self._target_location
         }
 
     def _get_info(self):
@@ -120,23 +120,27 @@ class MazeEnv(gym.Env):
 
         pix_square_size = (self.window_size / self.size)  # The size of a single grid square in pixels
 
-        # First we draw the target
-        pygame.draw.rect(
-            canvas,
-            (255, 0, 0),
-            pygame.Rect(
-                pix_square_size * self._target_location,
-                (pix_square_size, pix_square_size),
-            ),
-        )
+        # Draw emoji instead of shapes
+        font = pygame.font.Font(None, int(pix_square_size * 0.8))
 
-        # Now we draw the agent
-        pygame.draw.circle(
-            canvas,
-            (0, 0, 255),
-            (self._agent_location + 0.5) * pix_square_size,
-            pix_square_size / 3,
-        )
+        try_fonts = ["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", None]
+        font = None
+        for f in try_fonts:
+            try:
+                font = pygame.font.SysFont(f, int(pix_square_size * 0.8)) if f else pygame.font.Font(None, int(pix_square_size * 0.8))
+                break
+            except Exception:
+                continue
+
+        # Draw goal emoji (🔚)
+        goal_emoji = font.render("🔚", True, (255, 0, 0))
+        goal_pos = pix_square_size * self._target_location
+        canvas.blit(goal_emoji, goal_pos)
+
+        # Draw agent emoji (💃🏻)
+        agent_emoji = font.render("💃🏻", True, (0, 0, 255))
+        agent_pos = pix_square_size * self._agent_location
+        canvas.blit(agent_emoji, agent_pos)
 
         # Finally, add some gridlines
         for x in range(self.size + 1):
@@ -179,7 +183,7 @@ if __name__ == "__main__":
     epsilon = 1.0    # exploration rate
     epsilon_decay = 0.995
     epsilon_min = 0.05
-    episodes = 5000
+    episodes = 15000
 
     # Q-table: dictionary mapping state -> action values
     Q = {}
@@ -246,5 +250,5 @@ if __name__ == "__main__":
             state = env._get_state()
 
             # small delay so the movement is visible
-            pygame.time.wait(200)
+            pygame.time.wait(500)
 
