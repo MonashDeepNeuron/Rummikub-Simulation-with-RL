@@ -137,8 +137,8 @@ class MazeEnv(gym.Env):
         goal_pos = pix_square_size * self._target_location
         canvas.blit(goal_emoji, goal_pos)
 
-        # Draw agent emoji (🕴🏻)
-        agent_emoji = font.render("🕴🏻", True, (0, 0, 255))
+        # Draw agent emoji (💃🏻)
+        agent_emoji = font.render("💃🏻", True, (0, 0, 255))
         agent_pos = pix_square_size * self._agent_location
         canvas.blit(agent_emoji, agent_pos)
 
