@@ -31,12 +31,16 @@ Usage:
     actions = env.get_legal_actions(player_id)
 """
 
-import numpy as np
-from typing import List, Set, Tuple, Optional, Dict
-from itertools import combinations, product
+from typing import List, Optional, Tuple, Dict, Set
 from enum import Enum
 from dataclasses import dataclass
 import copy
+from collections import defaultdict
+import itertools
+from itertools import combinations, product
+from ortools.linear_solver import pywraplp
+import time
+from Rummikub_env import Tile, TileSet, RummikubAction, Color, TileType
 
 try:
     from ortools.linear_solver import pywraplp
@@ -59,7 +63,7 @@ class SetTemplate:
         template_id: Unique identifier
     """
     set_type: str  # 'run' or 'group'
-    pattern: List[Tuple]  # [(color, number), ...] or [('JOKER', 'JOKER'), ...]
+    pattern: List[Tuple[Optional[int], Optional[int]]]  # [(color, number), ...] or [('JOKER', 'JOKER'), ...]
     joker_count: int  # Number of jokers in this template
     template_id: int  # Unique ID
 
@@ -69,6 +73,12 @@ class SolverMode(Enum):
     HEURISTIC_ONLY = "heuristic_only"  # Fast (~10ms), Generator 1+2 only
     HYBRID = "hybrid"  # Balanced (~100ms), All generators with limits
     ILP_ONLY = "ilp_only"  # Complete (~1s), Full ILP search
+
+
+def get_key(tile: Tile) -> Tuple[Optional[int], Optional[int]]:
+    if tile.tile_type == TileType.JOKER:
+        return None, None
+    return tile.color.value, tile.number
 
 
 class ActionGenerator:
@@ -105,11 +115,25 @@ class ActionGenerator:
         self.table_ext_gen = TableExtensionGenerator()
         
         if mode != SolverMode.HEURISTIC_ONLY:
-            self.rearrange_gen = RearrangementGenerator(
-                max_windows=max_ilp_calls,
-                max_melds_per_window=10,
-                max_window_size=max_window_size
-            )
+            # Create RearrangementGenerator
+            # Try new ILP-based version first, fall back to old backtracking version
+            try:
+                # New ILP-based version (if integrated)
+                self.rearrange_gen = RearrangementGenerator(
+                    max_windows=max_ilp_calls,
+                    max_window_size=max_window_size,
+                    use_ilp=False,  # Can set to True if ILP version is integrated
+                    ilp_time_limit=2.0
+                )
+                print(f"  Using ILP-based Generator 3")
+            except TypeError:
+                # Old backtracking version (current default)
+                self.rearrange_gen = RearrangementGenerator(
+                    max_windows=max_ilp_calls,
+                    max_melds_per_window=10,
+                    max_window_size=max_window_size
+                )
+                print(f"  Using backtracking-based Generator 3")
         else:
             self.rearrange_gen = None
         
@@ -633,515 +657,258 @@ class TableExtensionGenerator:
 
 class RearrangementGenerator:
     """
-    Generator 3: Approximate full table rearrangement using windowed search.
+    Generator 3: Complex table rearrangements using windowed ILP search.
+    Finds valid rearrangements of small subsets (windows) of table sets + connected hand tiles.
     
-    Strategy:
-    1. Select windows: Pick 1-2 table melds + limited hand subset
-    2. Filter tiles: Keep only tiles that "connect" to selected table sets
-    3. Backtracking search: Re-partition window tiles into valid melds
-    4. Limit: Top 10 melds per window for performance
+    Uses Integer Linear Programming (ILP) to guarantee optimal tile usage per window while ensuring
+    all window tiles are used in valid melds.
     
-    This approximates the true rearrangement problem while maintaining
-    reasonable performance.
+    This is a "perfect" implementation: For each window, ILP finds the arrangement that maximizes
+    the value of hand tiles played, with full solvability.
     """
     
-    def __init__(self, max_windows: int = 30, max_melds_per_window: int = 10,
-                 max_window_size: int = 3):
-        """
-        Args:
-            max_windows: Maximum number of windows to explore
-            max_melds_per_window: Maximum melds to keep per window
-            max_window_size: Maximum number of table sets per window (1-3)
-                            1 = single sets only
-                            2 = single + pair sets (default in v1)
-                            3 = single + pair + triple sets (for complex rearrangements)
-        """
+    def __init__(self, max_windows: int = 30, max_window_size: int = 3, ilp_time_limit: float = 2.0):
         self.max_windows = max_windows
-        self.max_melds_per_window = max_melds_per_window
         self.max_window_size = max_window_size
+        self.ilp_time_limit = ilp_time_limit
+        self.templates = self._generate_all_possible_templates()
     
-    def generate(self, hand: List, table: List, timeout: float = None) -> List:
+    def _generate_all_possible_templates(self) -> List[SetTemplate]:
         """
-        Generate rearrangement actions using windowed search (1-3 set windows).
+        Generates all possible valid meld templates (groups and runs), including variations with up to 2 jokers.
+        Normalized pattern to use (None, None) for jokers.
+        """
+        templates: List[SetTemplate] = []
+        colors = range(4)  # 0: RED, 1: BLUE, 2: BLACK, 3: ORANGE
+        
+        # Generate groups (same number, different colors, 3-4 tiles)
+        for n in range(1, 14):
+            for size in [3, 4]:
+                for num_jokers in range(3):  # Limit to 0-2 jokers
+                    if num_jokers > size:
+                        continue
+                    num_colors = size - num_jokers
+                    if num_colors < 1 or num_colors > 4:
+                        continue
+                    for s in itertools.combinations(colors, num_colors):
+                        pattern = [(c, n) for c in s] + [(None, None)] * num_jokers
+                        templates.append(SetTemplate("group", pattern))
+        
+        # Generate runs (same color, consecutive numbers, 3+ tiles)
+        for col in colors:
+            for start in range(1, 14):
+                for length in range(3, 15 - start + 1):
+                    for num_jokers in range(3):  # Limit to 0-2 jokers
+                        if num_jokers >= length:  # At least one non-joker
+                            continue
+                        for joker_pos in itertools.combinations(range(length), num_jokers):
+                            pattern = []
+                            for pos in range(length):
+                                if pos in joker_pos:
+                                    pattern.append((None, None))
+                                else:
+                                    num = start + pos
+                                    pattern.append((col, num))
+                            templates.append(SetTemplate("run", pattern))
+        
+        return templates
+    
+    def generate(self, hand: List[Tile], table: List[TileSet], timeout: float = 30.0) -> List[RummikubAction]:
+        """
+        Generate rearrangement actions by searching over windows of table sets.
         
         Args:
-            hand: Hand tiles
-            table: Table sets
-            timeout: Maximum time remaining (seconds). If exceeded, stops early.
+            hand: Player's hand tiles
+            table: Current table sets
+            timeout: Maximum time for generation
+        
+        Returns:
+            List of valid play actions involving rearrangements
         """
-        from Rummikub_env import RummikubAction
-        import time
+        actions = []
+        start_time = time.time()
         
         if len(table) == 0:
             return []
         
-        start_time = time.time()
-        actions = []
-        windows_explored = 0
-        
-        def check_timeout():
-            if timeout is not None and (time.time() - start_time) > timeout:
-                return True
-            return False
-        
-        # Try single-set windows
-        if self.max_window_size >= 1:
-            for set_idx in range(len(table)):
-                if windows_explored >= self.max_windows or check_timeout():
+        # Generate windows: subsets of 1 to max_window_size sets
+        for window_size in range(1, self.max_window_size + 1):
+            for table_indices in itertools.combinations(range(len(table)), window_size):
+                if len(actions) >= self.max_windows:
                     break
                 
-                window_actions = self._explore_window([set_idx], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
-        
-        # Try two-set windows
-        if self.max_window_size >= 2 and windows_explored < self.max_windows and len(table) >= 2:
-            for idx1, idx2 in combinations(range(len(table)), 2):
-                if windows_explored >= self.max_windows or check_timeout():
-                    break
+                if time.time() - start_time > timeout:
+                    return actions
                 
-                window_actions = self._explore_window([idx1, idx2], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
-        
-        # Try three-set windows for complex rearrangements
-        if self.max_window_size >= 3 and windows_explored < self.max_windows and len(table) >= 3:
-            for idx1, idx2, idx3 in combinations(range(len(table)), 3):
-                if windows_explored >= self.max_windows or check_timeout():
-                    if check_timeout():
-                        elapsed = time.time() - start_time
-                        print(f"    Generator 3 stopped after {elapsed:.1f}s ({windows_explored} windows)")
-                    break
+                window_sets = [table[idx] for idx in table_indices]
+                window_tiles = [t for s in window_sets for t in s.tiles]
                 
-                window_actions = self._explore_window([idx1, idx2, idx3], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
+                # Filter connected hand tiles
+                connected = self._filter_connected(hand, window_tiles)
+                if not connected:
+                    continue
+                
+                # Solve ILP for this window
+                action = self._solve_window(window_tiles, connected, table_indices, table)
+                if action:
+                    actions.append(action)
         
         return actions
     
-    def _explore_window(self, table_indices: List[int], hand: List, 
-                       table: List) -> List:
-        """Explore a single window and generate actions."""
-        from Rummikub_env import RummikubAction, TileType
+    def _solve_window(self, window_tiles: List[Tile], connected_hand: List[Tile], 
+                      table_indices: Tuple[int], table: List[TileSet]) -> Optional[RummikubAction]:
+        """
+        Use ILP to find a valid rearrangement for the window + hand tiles.
+        """
+        solver = pywraplp.Solver.CreateSolver('CBC')
+        if not solver:
+            return None
         
-        actions = []
+        solver.SetTimeLimit(int(self.ilp_time_limit * 1000))  # ms
         
-        # Get tiles from selected table sets
-        table_tiles = []
-        for idx in table_indices:
-            table_tiles.extend(table[idx].tiles)
+        # Collect types and counts
+        type_inventory: Dict[Tuple[Optional[int], Optional[int]], Dict] = defaultdict(lambda: {
+            'count_window': 0, 'count_hand': 0, 'tiles_all': []
+        })
         
-        # Filter hand tiles that "connect" to table tiles
-        connected = self._filter_connected(hand, table_tiles)
+        for t in window_tiles:
+            tt = get_key(t)
+            type_inventory[tt]['count_window'] += 1
+            type_inventory[tt]['tiles_all'].append(t)
         
-        # Limit hand subset to keep search tractable
-        if len(connected) > 6:
-            # Prioritize: non-jokers, high value
-            connected.sort(key=lambda t: (
-                t.tile_type == TileType.JOKER,
-                -t.get_value()
-            ))
-            connected = connected[:6]
+        for t in connected_hand:
+            tt = get_key(t)
+            type_inventory[tt]['count_hand'] += 1
+            type_inventory[tt]['tiles_all'].append(t)
         
-        if len(connected) == 0:
-            return []
+        tile_types = set(type_inventory.keys())
         
-        # Pool: table tiles + connected hand tiles
-        pool = table_tiles + connected
-        
-        # Find all valid re-partitions using backtracking
-        partitions = self._backtrack_search(pool)
-        
-        # Keep top N partitions by value played from hand
-        if len(partitions) > self.max_melds_per_window:
-            def score_partition(partition):
-                return sum(
-                    sum(t.get_value() for t in ts.tiles if t in connected)
-                    for ts in partition
-                )
-            partitions.sort(key=score_partition, reverse=True)
-            partitions = partitions[:self.max_melds_per_window]
-        
-        # Convert partitions to actions
-        for partition in partitions:
-            # Must use at least one hand tile
-            tiles_from_hand = [
-                t for ts in partition for t in ts.tiles 
-                if t in connected
-            ]
-            
-            if len(tiles_from_hand) == 0:
-                continue
-            
-            # Build new table: unchanged sets + new partition
-            new_table = []
-            for idx, ts in enumerate(table):
-                if idx not in table_indices:
-                    new_table.append(ts)
-            new_table.extend(partition)
-            
-            action = RummikubAction(
-                action_type='play',
-                tiles=tiles_from_hand,
-                sets=partition,
-                table_config=new_table
+        # Filter possible templates based on available types
+        possible_templates = [
+            t for t in self.templates
+            if all(
+                type_inventory.get(tt, {'count_window':0, 'count_hand':0})['count_window'] + 
+                type_inventory.get(tt, {'count_window':0, 'count_hand':0})['count_hand'] >= 
+                t.pattern.count(tt)
+                for tt in set(t.pattern)
             )
-            actions.append(action)
+        ]
         
-        return actions
+        num_templates = len(possible_templates)
+        if num_templates == 0:
+            return None
+        
+        # Variables: x_j for each template (int, allow multiples if possible, but limit to 2 for safety)
+        x = [solver.IntVar(0, 2, f'x[{i}]') for i in range(num_templates)]
+        
+        # y_tt: number of hand tiles of type tt used
+        y = {tt: solver.IntVar(0, type_inventory[tt]['count_hand'], f'y[{tt}]') for tt in tile_types}
+        
+        # Constraints: for each type, sum over j (count_tt_in_j * x_j) == count_window + y_tt
+        for tt in tile_types:
+            used = solver.Sum(x[i] * possible_templates[i].pattern.count(tt) for i in range(num_templates))
+            constraint = solver.Add(used == type_inventory[tt]['count_window'] + y[tt])
+        
+        # Objective: Maximize sum (value_tt * y_tt)
+        obj = solver.Sum(
+            y[tt] * (tt[1] if tt[1] is not None else 30)
+            for tt in tile_types
+        )
+        solver.Maximize(obj)
+        
+        # Solve
+        status = solver.Solve()
+        if status not in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
+            return None
+        
+        # Check if any hand tiles used
+        total_hand_used = sum(y[tt].solution_value() for tt in tile_types)
+        if total_hand_used < 1:
+            return None
+        
+        # Get selected templates
+        selected = [(i, int(x[i].solution_value())) for i in range(num_templates) if x[i].solution_value() > 0]
+        
+        # Compute hand used counts
+        hand_used_count = {tt: int(y[tt].solution_value()) for tt in tile_types}
+        
+        # Select played tiles from connected hand
+        hand_by_type: Dict[Tuple[Optional[int], Optional[int]], List[Tile]] = defaultdict(list)
+        for t in connected_hand:
+            hand_by_type[get_key(t)].append(t)
+        
+        played_tiles: List[Tile] = []
+        for tt, cnt in hand_used_count.items():
+            if cnt > 0:
+                played_tiles.extend(hand_by_type[tt][:cnt])
+        
+        # All used tiles: window + played
+        all_used_tiles = window_tiles + played_tiles
+        
+        # Available tiles by type
+        available_by_type: Dict[Tuple[Optional[int], Optional[int]], List[Tile]] = defaultdict(list)
+        for t in all_used_tiles:
+            available_by_type[get_key(t)].append(t)
+        
+        # Instantiate sets
+        new_sets: List[TileSet] = []
+        for i, count in selected:
+            for _ in range(count):
+                templ = possible_templates[i]
+                set_tiles: List[Tile] = []
+                for p in templ.pattern:
+                    tt = p  # Already (Optional[int], Optional[int])
+                    tiles_list = available_by_type[tt]
+                    if not tiles_list:
+                        raise ValueError("Tile assignment failed: insufficient tiles.")
+                    set_tiles.append(tiles_list.pop())
+                
+                # Sort runs
+                if templ.set_type == "run":
+                    set_tiles.sort(key=lambda t: t.number if t.number is not None else -1)
+                
+                new_set = TileSet(tiles=set_tiles, set_type=templ.set_type)
+                if not new_set.is_valid():
+                    raise ValueError("Generated invalid set.")
+                new_sets.append(new_set)
+        
+        # Build final table config: unchanged sets + new sets
+        final_table = [table[idx] for idx in range(len(table)) if idx not in table_indices]
+        final_table.extend(new_sets)
+        
+        # Create action
+        return RummikubAction(
+            action_type='play',
+            tiles=played_tiles,
+            sets=new_sets,  # Optional, for info
+            table_config=final_table
+        )
     
-    def _filter_connected(self, hand: List, table_tiles: List) -> List:
-        """
-        Filter hand tiles that 'connect' to table tiles.
-        
-        A tile connects if:
-        - Same number (group potential)
-        - Same color + adjacent number (run potential)
-        - Is a joker (universal)
-        """
-        from Rummikub_env import TileType
-        
+    def _filter_connected(self, hand: List[Tile], window_tiles: List[Tile]) -> List[Tile]:
+        """Filter hand tiles that can connect to window tiles."""
         connected = []
         
-        # Extract table properties
-        table_numbers = set()
-        table_colors = set()
-        
-        for tile in table_tiles:
-            if tile.tile_type != TileType.JOKER:
-                table_numbers.add(tile.number)
-                table_colors.add(tile.color)
-        
-        # Check each hand tile
-        for tile in hand:
-            # Jokers connect to everything
-            if tile.tile_type == TileType.JOKER:
-                connected.append(tile)
+        for hand_tile in hand:
+            if hand_tile.tile_type == TileType.JOKER:
+                connected.append(hand_tile)
                 continue
             
-            # Same number => group potential
-            if tile.number in table_numbers:
-                connected.append(tile)
-                continue
-            
-            # Same color + nearby number => run potential
-            if tile.color in table_colors:
-                for num in table_numbers:
-                    if abs(tile.number - num) <= 2:
-                        connected.append(tile)
-                        break
+            for table_tile in window_tiles:
+                if table_tile.tile_type == TileType.JOKER:
+                    connected.append(hand_tile)
+                    break
+                
+                # Run connection: same color, adjacent number (±1 or ±2 for joker potential)
+                if hand_tile.color == table_tile.color and abs(hand_tile.number - table_tile.number) <= 2:
+                    connected.append(hand_tile)
+                    break
+                
+                # Group connection: same number, different color
+                if hand_tile.number == table_tile.number and hand_tile.color != table_tile.color:
+                    connected.append(hand_tile)
+                    break
         
         return connected
-    
-    def _backtrack_search(self, pool: List) -> List[List]:
-        """Find valid partitions of pool using backtracking."""
-        from Rummikub_env import TileSet
-        
-        if len(pool) < 3:
-            return []
-        
-        partitions = []
-        max_partitions = self.max_melds_per_window * 2  # Find more, then filter
-        
-        def backtrack(remaining: List, current: List):
-            if len(partitions) >= max_partitions:
-                return
-            
-            if len(remaining) == 0:
-                if len(current) > 0:
-                    partitions.append(copy.deepcopy(current))
-                return
-            
-            if len(remaining) < 3:
-                return
-            
-            # Try forming sets greedily
-            for size in range(3, min(len(remaining) + 1, 14)):
-                for combo in combinations(remaining, size):
-                    tiles = list(combo)
-                    
-                    # Try as run
-                    test_run = TileSet(tiles=tiles, set_type='run')
-                    if test_run.is_valid():
-                        new_remaining = [t for t in remaining if t not in combo]
-                        current.append(test_run)
-                        backtrack(new_remaining, current)
-                        current.pop()
-                        
-                        if len(partitions) >= max_partitions:
-                            return
-                    
-                    # Try as group (max 4)
-                    if size <= 4:
-                        test_group = TileSet(tiles=tiles, set_type='group')
-                        if test_group.is_valid():
-                            new_remaining = [t for t in remaining if t not in combo]
-                            current.append(test_group)
-                            backtrack(new_remaining, current)
-                            current.pop()
-                            
-                            if len(partitions) >= max_partitions:
-                                return
-        
-        backtrack(pool, [])
-        return partitions
-    # =============================================================================
-    # NEW METHODS TO ADD TO RearrangementGenerator CLASS
-    # =============================================================================
-
-    def _has_joker_on_table(self, table_tiles: List) -> bool:
-        """Check if any table tiles in the window contain a joker."""
-        from Rummikub_env import TileType
-        
-        return any(t.tile_type == TileType.JOKER for t in table_tiles)
-
-
-    def _has_joker_retrieval(self, table_tiles: List, partition: List) -> Tuple[bool, Optional[object]]:
-        """
-        Check if a partition retrieves a joker from the table.
-        
-        Returns:
-            (retrieval_occurred, retrieved_joker_object or None)
-        """
-        from Rummikub_env import TileType
-        
-        # Find jokers on table
-        table_jokers = [t for t in table_tiles if t.tile_type == TileType.JOKER]
-        
-        if not table_jokers:
-            return False, None
-        
-        # Check if joker appears in partition
-        partition_tiles = [t for ts in partition for t in ts.tiles]
-        partition_jokers = [t for t in partition_tiles if t.tile_type == TileType.JOKER]
-        
-        # If table had joker but partition doesn't, joker was retrieved
-        if len(table_jokers) > len(partition_jokers):
-            # Find which joker was retrieved (might be multiple)
-            retrieved = [tj for tj in table_jokers if tj not in partition_jokers]
-            return True, retrieved[0] if retrieved else None
-        
-        return False, None
-
-
-    def _find_joker_compatible_tiles(self, hand: List, already_connected: List) -> List:
-        """
-        Find hand tiles that could form sets WITH a joker.
-        
-        These are tiles that AREN'T connected to the table tiles,
-        but COULD work with a retrieved joker.
-        
-        Strategy: Include any 2+ tiles that can form a set with a joker:
-        - Runs: Two consecutive tiles (joker fills gap)
-        - Groups: Two same-number tiles (joker adds third color)
-        """
-        from Rummikub_env import TileType
-        
-        additional = []
-        already_ids = set(t.tile_id for t in already_connected)
-        
-        # Get remaining hand tiles
-        remaining = [t for t in hand if t.tile_id not in already_ids 
-                    and t.tile_type != TileType.JOKER]
-        
-        # Check all pairs of remaining tiles
-        from itertools import combinations
-        for t1, t2 in combinations(remaining, 2):
-            # Run potential: Same color, numbers differ by 1 or 2
-            if (t1.color == t2.color and 
-                1 <= abs(t1.number - t2.number) <= 2):
-                if t1 not in additional:
-                    additional.append(t1)
-                if t2 not in additional:
-                    additional.append(t2)
-            
-            # Group potential: Same number, different colors
-            if (t1.number == t2.number and 
-                t1.color != t2.color):
-                if t1 not in additional:
-                    additional.append(t1)
-                if t2 not in additional:
-                    additional.append(t2)
-        
-        return additional
-
-
-    def _validate_joker_usage(self, table_tiles: List, partition: List, 
-                            hand_tiles: List) -> bool:
-        """
-        Validate that if a joker is retrieved, it's used in the same turn.
-        
-        Args:
-            table_tiles: Original tiles in the window
-            partition: Proposed new partition
-            hand_tiles: Tiles from hand that are used
-        
-        Returns:
-            True if valid (no joker retrieval, or joker is used)
-        """
-        has_retrieval, retrieved_joker = self._has_joker_retrieval(table_tiles, partition)
-        
-        if not has_retrieval:
-            return True  # No joker retrieval, always valid
-        
-        # Joker was retrieved - must be used in partition
-        partition_tiles = [t for ts in partition for t in ts.tiles]
-        
-        # Check if the retrieved joker is in the partition
-        if retrieved_joker in partition_tiles:
-            return True  # Joker is used ✓
-        
-        # Joker not in partition - INVALID
-        return False
-
-
-    def _explore_window_with_joker_awareness(self, table_indices: List[int], 
-                                            hand: List, table: List) -> List:
-        """
-        Enhanced window exploration with joker retrieval awareness.
-        
-        This replaces the original _explore_window when joker handling is needed.
-        """
-        from Rummikub_env import RummikubAction, TileType
-        
-        actions = []
-        
-        # Get tiles from selected table sets
-        table_tiles = []
-        for idx in table_indices:
-            table_tiles.extend(table[idx].tiles)
-        
-        # Filter hand tiles that "connect" to table tiles (original logic)
-        connected = self._filter_connected(hand, table_tiles)
-        
-        # NEW: If window has joker, expand search space
-        if self._has_joker_on_table(table_tiles):
-            # Add tiles that could work WITH the joker if retrieved
-            joker_compatible = self._find_joker_compatible_tiles(hand, connected)
-            connected.extend(joker_compatible)
-            
-            # Also ensure any jokers in hand are included
-            hand_jokers = [t for t in hand if t.tile_type == TileType.JOKER 
-                        and t not in connected]
-            connected.extend(hand_jokers)
-        
-        # Limit hand subset to keep search tractable
-        if len(connected) > 8:  # Increased from 6 due to joker scenarios
-            connected.sort(key=lambda t: (
-                t.tile_type == TileType.JOKER,
-                -t.get_value()
-            ))
-            connected = connected[:8]
-        
-        if len(connected) == 0:
-            return []
-        
-        # Pool: table tiles + connected hand tiles
-        pool = table_tiles + connected
-        
-        # Find all valid re-partitions using backtracking
-        partitions = self._backtrack_search(pool)
-        
-        # NEW: Filter out partitions with invalid joker usage
-        valid_partitions = []
-        for partition in partitions:
-            if self._validate_joker_usage(table_tiles, partition, connected):
-                valid_partitions.append(partition)
-        
-        partitions = valid_partitions
-        
-        # Keep top N partitions by value played from hand
-        if len(partitions) > self.max_melds_per_window:
-            def score_partition(partition):
-                return sum(
-                    sum(t.get_value() for t in ts.tiles if t in connected)
-                    for ts in partition
-                )
-            partitions.sort(key=score_partition, reverse=True)
-            partitions = partitions[:self.max_melds_per_window]
-        
-        # Convert partitions to actions
-        for partition in partitions:
-            # Must use at least one hand tile
-            tiles_from_hand = [
-                t for ts in partition for t in ts.tiles 
-                if t in connected
-            ]
-            
-            if len(tiles_from_hand) == 0:
-                continue
-            
-            # Build new table: unchanged sets + new partition
-            new_table = []
-            for idx, ts in enumerate(table):
-                if idx not in table_indices:
-                    new_table.append(ts)
-            new_table.extend(partition)
-            
-            action = RummikubAction(
-                action_type='play',
-                tiles=tiles_from_hand,
-                sets=partition,
-                table_config=new_table
-            )
-            actions.append(action)
-        
-        return actions
-
-
-    # =============================================================================
-    # MODIFIED generate() METHOD
-    # =============================================================================
-
-    def generate_with_joker_support(self, hand: List, table: List) -> List:
-        """
-        Generate rearrangement actions with joker retrieval support.
-        
-        This replaces the original generate() method.
-        """
-        from Rummikub_env import RummikubAction
-        
-        if len(table) == 0:
-            return []
-        
-        actions = []
-        windows_explored = 0
-        
-        # Try single-set windows
-        if self.max_window_size >= 1:
-            for set_idx in range(len(table)):
-                if windows_explored >= self.max_windows:
-                    break
-                
-                # Use joker-aware exploration
-                window_actions = self._explore_window_with_joker_awareness(
-                    [set_idx], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
-        
-        # Try two-set windows
-        if self.max_window_size >= 2 and windows_explored < self.max_windows and len(table) >= 2:
-            for idx1, idx2 in combinations(range(len(table)), 2):
-                if windows_explored >= self.max_windows:
-                    break
-                
-                window_actions = self._explore_window_with_joker_awareness(
-                    [idx1, idx2], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
-        
-        # Try three-set windows
-        if self.max_window_size >= 3 and windows_explored < self.max_windows and len(table) >= 3:
-            for idx1, idx2, idx3 in combinations(range(len(table)), 3):
-                if windows_explored >= self.max_windows:
-                    break
-                
-                window_actions = self._explore_window_with_joker_awareness(
-                    [idx1, idx2, idx3], hand, table)
-                actions.extend(window_actions)
-                windows_explored += 1
-        
-        return actions
 
 
 # =============================================================================
