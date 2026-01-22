@@ -471,8 +471,8 @@ class ILPOpponent:
                          hand_tiles, table_sets):
         """Extract solution from ILP solver."""
         from Rummikub_env import RummikubAction
+        from collections import Counter
         
-        # Check if any tiles played
         tiles_played = sum(y_vars[tid].solution_value() for tid in tile_inventory.keys())
         
         if tiles_played == 0:
@@ -480,7 +480,7 @@ class ILPOpponent:
         
         # Build new table configuration
         new_table = []
-        used_tile_ids = []  # Use list to track tile IDs (allows duplicates for counting)
+        used_tile_counts = Counter()  # Track HOW MANY times each tile_id is used
         
         for j, var in x_vars.items():
             count = int(var.solution_value())
@@ -488,26 +488,29 @@ class ILPOpponent:
                 set_template = self.all_possible_sets[j]
                 
                 for _ in range(count):
-                    tile_set = self._instantiate_set(set_template, tile_inventory, set(used_tile_ids))
+                    tile_set = self._instantiate_set(set_template, tile_inventory, used_tile_counts)
                     if tile_set:
                         new_table.append(tile_set)
                         for tile in tile_set.tiles:
-                            used_tile_ids.append(tile.tile_id)  # Append to list (allows duplicates)
+                            used_tile_counts[tile.tile_id] += 1  # Increment count
         
-        # Count occurrences of each tile_id
-        from collections import Counter
-        used_tile_counts = Counter(used_tile_ids)
         
-        # Determine which hand tiles were played
+        # Determine which hand tiles were played using ILP solution (y_vars)
+        # The ILP solver tells us EXACTLY how many of each tile_id to play from hand
         hand_tiles_played = []
+        tiles_to_play_counts = {}  # tile_id -> how many to play from hand
+        
+        # Extract counts from ILP solution variables
+        for tile_id in y_vars:
+            count = int(y_vars[tile_id].solution_value())
+            if count > 0:
+                tiles_to_play_counts[tile_id] = count
+        
+        # Select the specified number of tiles from hand based on ILP solution
         for tile in hand_tiles:
-            # Check if this tile appears in new table MORE than on old table
-            times_in_new_table = used_tile_counts.get(tile.tile_id, 0)
-            times_on_old_table = tile_inventory[tile.tile_id]['on_table']
-            
-            # If appears MORE times in new table, it came from hand
-            if times_in_new_table > times_on_old_table:
+            if tile.tile_id in tiles_to_play_counts and tiles_to_play_counts[tile.tile_id] > 0:
                 hand_tiles_played.append(tile)
+                tiles_to_play_counts[tile.tile_id] -= 1
         
         if not new_table or not hand_tiles_played:
             return None
@@ -737,32 +740,41 @@ class ILPOpponent:
         
         return s_matrix
     
-    def _instantiate_set(self, set_template, tile_inventory, used_tiles):
+    def _instantiate_set(self, set_template, tile_inventory, used_counts):
         """Instantiate a set from template."""
         from Rummikub_env import TileSet, TileType
         
+        # Build list of available tiles, respecting how many times each has been used
+        from collections import Counter
+        
         available_tiles = []
         for tile_id, info in tile_inventory.items():
-            if tile_id not in used_tiles:
-                available_tiles.append(info['tile'])
+            total_available = info["on_table"] + info["in_hand"]
+            times_used = used_counts.get(tile_id, 0)
+            times_remaining = total_available - times_used
+            
+            # Add this tile to available list for each remaining occurrence
+            for _ in range(times_remaining):
+                available_tiles.append((tile_id, info["tile"]))
         
         if len(available_tiles) < len(set_template.pattern):
             return None
         
         selected_tiles = []
-        temp_used = set()
+        local_used = Counter()  # Track usage within this set
         
         for pattern_pos in set_template.pattern:
             found = False
             
-            for tile in available_tiles:
-                if tile.tile_id in temp_used:
+            for tile_id, tile in available_tiles:
+                # Check if we've already used this specific tile_id in this set
+                if local_used[tile_id] >= (used_counts.get(tile_id, 0) + 1):
                     continue
                 
-                if pattern_pos == ('JOKER', 'JOKER'):
+                if pattern_pos == ("JOKER", "JOKER"):
                     if tile.tile_type == TileType.JOKER:
                         selected_tiles.append(tile)
-                        temp_used.add(tile.tile_id)
+                        local_used[tile_id] += 1
                         found = True
                         break
                 else:
@@ -771,7 +783,7 @@ class ILPOpponent:
                         tile.color.value == p_color and
                         tile.number == p_number):
                         selected_tiles.append(tile)
-                        temp_used.add(tile.tile_id)
+                        local_used[tile_id] += 1
                         found = True
                         break
             

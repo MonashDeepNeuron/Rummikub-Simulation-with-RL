@@ -321,7 +321,7 @@ MODE 3: ILP_ONLY (Complete ~1s)
             print("Invalid choice. Please enter 1, 2, or 3.")
     
     # Attach action generator to environment
-    env.action_generator = ActionGenerator(mode=mode, max_ilp_calls=30)
+    env.action_generator = ActionGenerator(mode=mode, max_ilp_calls=50)
     
     # Choose opponent type
     print("\nChoose opponent:")
@@ -331,10 +331,10 @@ MODE 3: ILP_ONLY (Complete ~1s)
     while True:
         choice = input("Select opponent (1 or 2): ").strip()
         if choice == '1':
-            opponent = ILPOpponent(objective='maximize_value')
+            opponent = ILPOpponent(objective='maximize_value', timeout_seconds=60.0)
             break
         elif choice == '2':
-            opponent = ILPOpponent(objective='maximize_value_minimize_changes')
+            opponent = ILPOpponent(objective='maximize_value_minimize_changes', timeout_seconds=60.0)
             break
         else:
             print("Invalid choice. Please enter 1 or 2.")
@@ -400,6 +400,15 @@ MODE 3: ILP_ONLY (Complete ~1s)
                 print(f"  Played {len(action.tiles)} tiles")
                 tiles_str = ", ".join(str(t) for t in action.tiles)
                 print(f"  Tiles: {tiles_str}")
+                
+                # Validate that all tiles are actually in opponent's hand
+                opponent_hand = env.player_hands[env.current_player]
+                opponent_tile_ids = [t.tile_id for t in opponent_hand]
+                action_tile_ids = [t.tile_id for t in action.tiles]
+                
+                for action_tile_id in action_tile_ids:
+                    if action_tile_id not in opponent_tile_ids:
+                        print(f"  ⚠️ WARNING: Action includes tile {action_tile_id} not in opponent's hand!")
         
         # Execute action
         state, reward, done, info = env.step(action)
