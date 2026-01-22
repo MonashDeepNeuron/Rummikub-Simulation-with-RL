@@ -53,7 +53,7 @@ class ILPOpponent:
             time_limit: Maximum time for each ILP solve (seconds)
             M: Constant for secondary objective (default 40, as in paper)
             timeout_seconds: Overall timeout for action selection (default 60s)
-                           If exceeded, returns draw action
+                           Set to None or float('inf') to disable timeout
         """
         if not HAS_ORTOOLS:
             raise ImportError("ILP opponent requires ortools. Install with: pip install ortools")
@@ -71,7 +71,7 @@ class ILPOpponent:
         self.objective = objective
         self.time_limit = time_limit
         self.M = M
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else float('inf')
         
         # Determine if using Model 2 (with minimize changes)
         self.minimize_changes = 'minimize_changes' in objective
@@ -83,7 +83,10 @@ class ILPOpponent:
         print(f"  Objective: {objective}")
         print(f"  Model: {'2 (minimize changes)' if self.minimize_changes else '1 (simple)'}")
         print(f"  Set templates: {len(self.all_possible_sets)}")
-        print(f"  Timeout: {timeout_seconds}s")
+        if timeout_seconds is None or timeout_seconds == float('inf'):
+            print(f"  Timeout: DISABLED")
+        else:
+            print(f"  Timeout: {timeout_seconds}s")
     
     def select_action(self, hand_tiles: List, table_sets: List, 
                      has_melded: bool, pool_size: int):
