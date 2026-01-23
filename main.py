@@ -1,5 +1,6 @@
+# main.py
 """
-Main Training Script for Rummikub RL Agent, NOT DONE
+Main Training Script for Rummikub RL Agent
 
 This is where you train your RL agent against the ILP baseline opponent.
 
@@ -12,33 +13,9 @@ import time
 from typing import List
 from Rummikub_env import RummikubEnv, RummikubAction
 from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
-from Baseline_Opponent import ILPOpponent
-
-
-class RandomAgent:
-    """
-    Simple random agent for testing.
-    Replace this with your actual RL agent (DQN, PPO, AlphaZero, etc.)
-    """
-    
-    def __init__(self):
-        self.name = "RandomAgent"
-    
-    def select_action(self, state: dict, legal_actions: List[RummikubAction]) -> RummikubAction:
-        """Select a random action from legal actions."""
-        return np.random.choice(legal_actions)
-    
-    def learn(self, state, action, reward, next_state, done):
-        """
-        Update agent based on experience.
-        
-        This is where your RL algorithm would update:
-        - DQN: Update Q-network
-        - PPO: Collect trajectory and update policy
-        - AlphaZero: Update value/policy network with MCTS
-        """
-        pass  # Random agent doesn't learn
-
+from Baseline_Opponent2 import RummikubILPSolver
+from agent import ACAgent
+import matplotlib.pyplot as plt
 
 class TrainingStats:
     """Track training statistics."""
@@ -72,6 +49,11 @@ class TrainingStats:
             return 0.0
         return self.agent_wins / self.episodes
     
+    def get_draw_rate(self) -> float:
+        if self.episodes == 0:
+            return 0.0
+        return self.ties / self.episodes
+    
     def print_summary(self, last_n: int = 100):
         """Print training summary."""
         print(f"\n{'='*70}")
@@ -80,18 +62,26 @@ class TrainingStats:
         print(f"Total episodes: {self.episodes}")
         print(f"Agent wins: {self.agent_wins} ({self.get_win_rate():.1%})")
         print(f"Opponent wins: {self.opponent_wins}")
-        print(f"Ties: {self.ties}")
+        print(f"Ties: {self.ties} ({self.get_draw_rate():.1%})")
         print(f"Avg reward: {np.mean(self.episode_rewards):.2f}")
         print(f"Avg episode length: {np.mean(self.episode_lengths):.1f} turns")
         
         if len(self.episode_rewards) >= last_n:
             recent_rewards = self.episode_rewards[-last_n:]
             recent_wins = sum(1 for i in range(-last_n, 0) 
-                            if i < 0 and self.episode_rewards[i] > 0)
+                             if self.episode_rewards[i] > 0)
             print(f"\nLast {last_n} episodes:")
             print(f"  Win rate: {recent_wins/last_n:.1%}")
             print(f"  Avg reward: {np.mean(recent_rewards):.2f}")
 
+def plot_rewards(stats: TrainingStats):
+    plt.figure(figsize=(10, 5))
+    plt.plot(stats.episode_rewards)
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    plt.title('Agent Rewards per Episode')
+    plt.savefig('agent_rewards.png')
+    plt.close()
 
 def train_agent(agent, 
                 num_episodes: int = 1000,
@@ -112,7 +102,7 @@ def train_agent(agent,
     # Setup
     env = RummikubEnv()
     env.action_generator = ActionGenerator(mode=action_gen_mode, max_ilp_calls=30)
-    opponent = ILPOpponent(objective=opponent_objective)
+    opponent = RummikubILPSolver(objective=opponent_objective)
     stats = TrainingStats()
     
     print(f"\n{'='*70}")
@@ -138,6 +128,8 @@ def train_agent(agent,
         episode_reward = 0
         turn_count = 0
         
+        agent.observe(state)
+        
         # Episode loop
         while not done:
             turn_count += 1
@@ -154,7 +146,7 @@ def train_agent(agent,
                 next_state, reward, done, info = env.step(action)
                 
                 # Agent learns from this experience
-                agent.learn(state, action, reward, next_state, done)
+                agent.learn(state, action, reward, next_state, done, info)
                 
                 episode_reward += reward
                 state = next_state
@@ -168,10 +160,17 @@ def train_agent(agent,
                     len(env.tiles_deck)
                 )
                 
-                state, reward, done, info = env.step(action)
+                next_state, reward_opp, done, info = env.step(action)
+                agent.learn(None, None, reward_opp, next_state, done, info)
+                agent.observe(next_state)
+                state = next_state
         
         # Record episode results
         stats.record_episode(env.winner, agent_player, episode_reward, turn_count)
+        
+        # Save agent every 50 episodes
+        if (episode + 1) % 50 == 0:
+            agent.save(f'trained_agent_episode_{episode + 1}.pth')
         
         # Print progress
         if verbose and (episode + 1) % 10 == 0:
@@ -209,7 +208,7 @@ def evaluate_agent(agent,
     """
     env = RummikubEnv()
     env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=30)
-    opponent = ILPOpponent(objective=opponent_objective)
+    opponent = RummikubILPSolver(objective=opponent_objective)
     
     wins = 0
     losses = 0
@@ -223,11 +222,13 @@ def evaluate_agent(agent,
         
         # Agent always player 0 for evaluation
         agent_player = 0
+        agent.observe(state)
         
         while not done:
             if env.current_player == agent_player:
                 legal_actions = env.get_legal_actions(agent_player)
                 action = agent.select_action(state, legal_actions)
+                state, reward, done, info = env.step(action)
             else:
                 action = opponent.select_action(
                     env.player_hands[1],
@@ -235,8 +236,8 @@ def evaluate_agent(agent,
                     env.has_melded[1],
                     len(env.tiles_deck)
                 )
-            
-            state, reward, done, info = env.step(action)
+                state, reward, done, info = env.step(action)
+                agent.observe(state)
         
         if env.winner == agent_player:
             wins += 1
@@ -275,12 +276,11 @@ def main():
     print("="*70)
     
     # Create your agent
-    # TODO: Replace RandomAgent with your actual RL agent (DQN, PPO, etc.)
-    agent = RandomAgent()
+    agent = ACAgent()
     
     # Training configuration
     config = {
-        'num_episodes': 1000,
+        'num_episodes': 10,
         'opponent_objective': 'maximize_value_minimize_changes',  # Use Model 2
         'action_gen_mode': SolverMode.HYBRID,  # Balanced speed/completeness
         'verbose': True
@@ -294,15 +294,17 @@ def main():
     print("\nStarting training...")
     stats = train_agent(agent, **config)
     
+    # Plot rewards
+    plot_rewards(stats)
+    
     # Evaluate
     print("\n" + "="*70)
     print("Final evaluation against opponent...")
     results = evaluate_agent(agent, num_games=100)
     
-    # Save agent (if applicable)
-    # TODO: Implement agent saving
-    # agent.save('trained_agent.pkl')
-    # print("\nAgent saved to 'trained_agent.pkl'")
+    # Save final agent
+    agent.save('trained_agent_final.pth')
+    print("\nAgent saved to 'trained_agent_final.pth'")
     
     print("\nTraining complete! 🎉")
 
