@@ -136,20 +136,21 @@ class TileSet:
         if len(numbers) > 0:
             numbers.sort()
             
-            # With jokers, we need to check if the gaps can be filled
             min_num = numbers[0]
             max_num = numbers[-1]
             expected_length = max_num - min_num + 1
             
-            # Total tiles should equal the range
-            if expected_length != len(self.tiles):
+            # NEW: Allow jokers to extend ends by checking internal missing <= joker_count
+            # (instead of strict expected_length == len(self.tiles))
+            internal_missing = expected_length - len(numbers)
+            if internal_missing > joker_count:
                 return False
             
-            # Check that we have the right number of jokers to fill gaps
+            # Optional: Verify the exact missing within the span (for safety, though redundant with above)
             all_numbers_in_range = set(range(min_num, max_num + 1))
             missing_numbers = all_numbers_in_range - set(numbers)
             
-            if len(missing_numbers) != joker_count:
+            if len(missing_numbers) > joker_count:  # Updated from != to >
                 return False
         
         return True
@@ -244,16 +245,17 @@ class RummikubEnv:
             for color in Color:
                 for number in range(1, 14):
                     tile = Tile(color=color, number=number, 
-                               tile_type=TileType.NORMAL, tile_id=tile_id)
+                            tile_type=TileType.NORMAL, tile_id=tile_id)
                     self.tiles_deck.append(tile)
-                    tile_id += 1
+                    tile_id += 1  # Make sure this is indented under the number loop
         
         # Create 2 jokers
         for _ in range(2):
             tile = Tile(color=None, number=None, 
-                       tile_type=TileType.JOKER, tile_id=tile_id)
+                    tile_type=TileType.JOKER, tile_id=tile_id)
             self.tiles_deck.append(tile)
-            tile_id += 1
+            tile_id += 1  # This MUST be indented under the for _ in range(2): loop
+                        # If it's not indented (aligned with 'for'), both jokers get the same tile_id
     
     def reset(self) -> Dict:
         """Reset the environment for a new game"""
@@ -494,13 +496,13 @@ class RummikubEnv:
         # Condition 2: No more tiles in pool
         elif len(self.tiles_deck) == 0:
             # Check if anyone can make a move
-            current_can_play = len(self.get_legal_actions(self.current_player)) > 1  # >1 because draw always exists
+            current_can_play = len(self.get_legal_actions(self.current_player)) > 0  # FIXED: >0 instead of >1
             next_player = 1 - self.current_player
             
             # Switch to next player temporarily to check their actions
             temp_current = self.current_player
             self.current_player = next_player
-            next_can_play = len(self.get_legal_actions(next_player)) > 1
+            next_can_play = len(self.get_legal_actions(next_player)) > 0  # FIXED: >0 instead of >1
             self.current_player = temp_current
             
             # If neither player can play, game ends

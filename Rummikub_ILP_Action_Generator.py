@@ -342,43 +342,87 @@ class HandPlayGenerator:
         
         return actions
     
-    def _find_all_valid_sets(self, hand: List) -> List[TileSet]:
+    def _find_all_valid_sets(self, hand: List[Tile]) -> List[TileSet]:
         """Find all possible valid groups and runs from hand."""
+        from collections import defaultdict
+        from Rummikub_env import TileSet, Color, TileType
+        
         sets = []
         
-        # Group by color and number for efficiency
-        by_number = defaultdict(list)
-        by_color = defaultdict(list)
         jokers = [t for t in hand if t.tile_type == TileType.JOKER]
+        non_jokers = [t for t in hand if t.tile_type != TileType.JOKER]
         num_jokers = len(jokers)
         
-        for tile in hand:
-            if tile.tile_type != TileType.JOKER:
-                by_number[tile.number].append(tile)
-                by_color[tile.color].append(tile)
+        # Find groups
+        by_number = defaultdict(list)
+        for t in non_jokers:
+            by_number[t.number].append(t)
         
-        # Find groups (same number, different colors)
         for num, tiles in by_number.items():
-            # Possible group sizes 3-4, with 0-2 jokers
-            for size in [3, 4]:
-                if len(tiles) + num_jokers >= size and len(tiles) >= size - 2:
-                    # Select distinct colors
-                    color_set = set(t.color for t in tiles)
-                    if len(color_set) + num_jokers >= size:
-                        # Create group
-                        group_tiles = tiles[:size - max(0, size - len(tiles))] + jokers[:max(0, size - len(tiles))]
-                        sets.append(TileSet(group_tiles, 'group'))
+            by_color = defaultdict(list)
+            for t in tiles:
+                by_color[t.color].append(t)
+            
+            available_colors = list(by_color.keys())
+            num_available = len(available_colors)
+            
+            for group_size in range(3, 5):
+                for num_jok in range(max(0, group_size - num_available), min(num_jokers, group_size - 1) + 1):
+                    num_needed_colors = group_size - num_jok
+                    if num_needed_colors > num_available:
+                        continue
+                    
+                    for selected_colors in itertools.combinations(available_colors, num_needed_colors):
+                        selected_tiles = [by_color[col][0] for col in selected_colors]
+                        selected_jokers = jokers[:num_jok]
+                        group_tiles = selected_tiles + selected_jokers
+                        new_group = TileSet(group_tiles, "group")
+                        if new_group.is_valid():
+                            sets.append(new_group)
         
-        # Find runs (same color, consecutive)
-        for color, tiles in by_color.items():
-            tiles.sort(key=lambda t: t.number)
-            # Find consecutive sequences with gaps for jokers
-            for length in range(3, len(tiles) + num_jokers + 1):
-                # Logic to find valid run starts and joker placements
-                # (Implement detailed run finding here, similar to combinatorics)
-                pass  # Placeholder - expand as in previous versions
+        # Find runs
+        by_color = defaultdict(list)
+        for t in non_jokers:
+            by_color[t.color].append(t)
         
-        return [s for s in sets if s.is_valid()]
+        for col in Color:
+            col_tiles = by_color[col]
+            if len(col_tiles) == 0:
+                continue
+            
+            by_num = defaultdict(list)
+            for t in col_tiles:
+                by_num[t.number].append(t)
+            
+            available_nums = sorted(by_num.keys())
+            n = len(available_nums)
+            
+            for mask in range(1, 1 << n):
+                subset_nums = [available_nums[i] for i in range(n) if (mask & (1 << i))]
+                if len(subset_nums) < 1:
+                    continue
+                
+                subset_nums.sort()
+                min_num = subset_nums[0]
+                max_num = subset_nums[-1]
+                expected = max_num - min_num + 1
+                missing = expected - len(subset_nums)
+                
+                if missing < 0 or missing > num_jokers:
+                    continue
+                
+                length = expected
+                if length < 3:
+                    continue
+                
+                selected_tiles = [by_num[num][0] for num in subset_nums]
+                selected_jokers = jokers[:missing]
+                run_tiles = selected_tiles + selected_jokers
+                new_run = TileSet(run_tiles, "run")
+                if new_run.is_valid():
+                    sets.append(new_run)
+        
+        return sets
 
 
 # =============================================================================
@@ -660,6 +704,13 @@ class RearrangementGenerator:
                 
                 new_set = TileSet(tiles=set_tiles, set_type=templ.set_type)
                 if not new_set.is_valid():
+                    print("Invalid set detected:")
+                    print(f"Template type: {templ.set_type}")
+                    print(f"Template pattern: {templ.pattern}")
+                    print(f"Assigned tiles: {[str(t) for t in set_tiles]}")
+                    print(f"Tile IDs: {[t.tile_id for t in set_tiles]}")
+                    print(f"Joker count: {sum(1 for t in set_tiles if t.tile_type == TileType.JOKER)}")
+                    print(f"Non-joker tiles: {[str(t) for t in set_tiles if t.tile_type != TileType.JOKER]}")
                     raise ValueError("Generated invalid set.")
                 new_sets.append(new_set)
         

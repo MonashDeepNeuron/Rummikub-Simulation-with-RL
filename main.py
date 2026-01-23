@@ -101,8 +101,8 @@ def train_agent(agent,
     
     # Setup
     env = RummikubEnv()
-    env.action_generator = ActionGenerator(mode=action_gen_mode, max_ilp_calls=30)
-    opponent = RummikubILPSolver(objective=opponent_objective)
+    env.action_generator = ActionGenerator(mode=action_gen_mode, max_ilp_calls=50, max_window_size=7, timeout_seconds=45)
+    opponent = RummikubILPSolver()
     stats = TrainingStats()
     
     print(f"\n{'='*70}")
@@ -153,13 +153,20 @@ def train_agent(agent,
                 
             else:
                 # Opponent's turn
-                action = opponent.select_action(
+                agent.pre_opponent_turn(state)
+                
+                print("ILP opponent thinking...", end="", flush=True)
+                
+                action = opponent.solve(
                     env.player_hands[env.current_player],
                     env.table,
-                    env.has_melded[env.current_player],
-                    len(env.tiles_deck)
+                    env.has_melded[env.current_player]
                 )
+                if action is None:
+                    action = RummikubAction(action_type='draw')
                 
+                print(" done")
+
                 next_state, reward_opp, done, info = env.step(action)
                 agent.learn(None, None, reward_opp, next_state, done, info)
                 agent.observe(next_state)
@@ -207,8 +214,8 @@ def evaluate_agent(agent,
         dict with evaluation metrics
     """
     env = RummikubEnv()
-    env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=30)
-    opponent = RummikubILPSolver(objective=opponent_objective)
+    env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=75, max_window_size=9, timeout_seconds=30)
+    opponent = RummikubILPSolver()
     
     wins = 0
     losses = 0
@@ -230,12 +237,17 @@ def evaluate_agent(agent,
                 action = agent.select_action(state, legal_actions)
                 state, reward, done, info = env.step(action)
             else:
-                action = opponent.select_action(
-                    env.player_hands[1],
+                # Opponent's turn
+                agent.pre_opponent_turn(state)
+                
+                action = opponent.solve(
+                    env.player_hands[env.current_player],
                     env.table,
-                    env.has_melded[1],
-                    len(env.tiles_deck)
+                    env.has_melded[env.current_player]
                 )
+                if action is None:
+                    action = RummikubAction(action_type='draw')
+                
                 state, reward, done, info = env.step(action)
                 agent.observe(state)
         
@@ -280,7 +292,7 @@ def main():
     
     # Training configuration
     config = {
-        'num_episodes': 10,
+        'num_episodes': 500,
         'opponent_objective': 'maximize_value_minimize_changes',  # Use Model 2
         'action_gen_mode': SolverMode.HYBRID,  # Balanced speed/completeness
         'verbose': True

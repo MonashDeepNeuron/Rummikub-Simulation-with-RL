@@ -61,106 +61,155 @@ class ActorCritic(nn.Module):
         )
 
     def forward(self, state_vec, action_vecs, hidden):
-        input_lstm = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # [1,1,110]
+        input_lstm = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         out, new_hidden = self.lstm(input_lstm, hidden)
-        out = out.squeeze(0).squeeze(0)
-        value = self.critic_head(out)
+        out = out.squeeze(0).squeeze(0)           # shape [128]
+
+        value = self.critic_head(out).squeeze(-1)  # shape []
+        
         if action_vecs is None:
             return value, new_hidden
-        action_inputs = [torch.cat((out, torch.tensor(a_vec, dtype=torch.float32))) for a_vec in action_vecs]
+        
+        action_inputs = [torch.cat((out, torch.tensor(a_vec, dtype=torch.float32))) 
+                        for a_vec in action_vecs]
         logits = torch.stack([self.actor_head(a_input) for a_input in action_inputs]).squeeze(1)
         return value, logits, new_hidden
+
+
 
 class ACAgent:
     def __init__(self):
         self.net = ActorCritic()
         self.optimizer = optim.Adam(self.net.parameters(), lr=0.001)
         self.hidden = (torch.zeros(1, 1, 128), torch.zeros(1, 1, 128))
+
         self.name = "ACAgent"
-        self.last_value = None
-        self.last_log_prob = None
-        self.last_logits = None
-        self.last_next_value = None
+
+        # Buffers for last transition (agent's turn)
+        self.last_value      = None
+        self.last_log_prob   = None
+        self.last_logits     = None
+
+        # For opponent's turn value estimation
+        self.last_opponent_value = None
+
+        # Safety / reset flags
+        self.last_state_value    = None   # mostly unused now
+
+    def pre_opponent_turn(self, state: Dict):
+        """Called just before opponent acts → capture value estimate"""
+        state_vec = get_state_vec(state)
+        with torch.no_grad():
+            value, new_hidden = self.net(state_vec, None, self.hidden)
+        self.last_opponent_value = value
+        self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
 
     def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> RummikubAction:
+        if not legal_actions:
+            return RummikubAction(action_type='draw') #Instead of raise, fallback to draw (safety net)
+
         state_vec = get_state_vec(state)
         action_vecs = [get_action_vec(a) for a in legal_actions]
-        with torch.no_grad():
-            value, logits, new_hidden = self.net(state_vec, action_vecs, self.hidden)
-        self.hidden = new_hidden
-        self.last_value = value
-        probs = torch.softmax(logits, dim=0).cpu().numpy()
-        idx = np.random.choice(len(legal_actions), p=probs)
-        self.last_log_prob = torch.log_softmax(logits, dim=0)[idx]
-        self.last_logits = logits
-        return legal_actions[idx]
+
+        value, logits, new_hidden = self.net(state_vec, action_vecs, self.hidden)
+
+        # Detach hidden to prevent long-term graph accumulation
+        self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
+
+        # Sample
+        dist = torch.distributions.Categorical(logits=logits)
+        idx = dist.sample()
+
+        # Save for learning
+        self.last_value     = value
+        self.last_log_prob  = dist.log_prob(idx)
+        self.last_logits    = logits
+
+        return legal_actions[int(idx.item())]
 
     def learn(self, state, action, reward, next_state, done, info):
+        """
+        state is None   → opponent's turn just happened
+        state is not None → agent's turn just happened
+        """
+        reward = float(reward)  # very important
+
+        # ─── Next value ───────────────────────────────────────────────
         if next_state is not None:
             next_state_vec = get_state_vec(next_state)
             with torch.no_grad():
                 next_value, new_hidden = self.net(next_state_vec, None, self.hidden)
-            self.last_next_value = next_value
+            self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
         else:
-            next_value = torch.tensor(0.0)
+            next_value = torch.tensor(0.0, dtype=torch.float32)
 
-        self.hidden = new_hidden if next_state is not None else self.hidden
-
-        if state is None:
-            # Opponent turn
-            reward = 0.0
-            if done:
-                my_hand_value = sum(t.get_value() for t in info.get('final_my_hand_value', next_state['my_hand'] if next_state else info.get('hand_value_after', 0)))
-                if 'win_type' in info:
-                    if info['win_type'] == 'emptied_hand':
-                        reward = -my_hand_value
-                    elif info['win_type'] == 'lowest_hand':
-                        if info['winner'] == next_state['current_player'] if next_state else self.current_player:  # Need to know agent_player, but assume from info
-                            # To make it work, assume 'winner' == 0 for agent (since agent_player random, but for simplicity, perhaps set agent_player=0 in main
-                            # For now, use if info['winner'] == next_state['current_player'] but since last actor is opp, if winner = opp, reward = -10 for agent
-                            reward = -10 if info['winner'] == 1 - next_state['current_player'] else 10  # flip
-                    elif info['win_type'] == 'tie':
-                        reward = 0
-        # Joker penalty
+        # Terminal correction + joker penalty
         if done:
-            if next_state is None:
-                jokers = 0
-            else:
-                jokers = sum(
-                    1
-                    for t in next_state["my_hand"]
-                    if t.tile_type == TileType.JOKER
-                )
+            # Joker penalty (our hand at the end)
+            jokers = 0
+            if next_state is not None and "my_hand" in next_state:
+                jokers = sum(1 for t in next_state["my_hand"] if t.tile_type == TileType.JOKER)
+            reward -= 30.0 * jokers
 
-            reward += -30 * jokers
+            # Optional: other terminal shaping from info
+            # if 'win_type' in info and info['win_type'] == 'emptied_hand':
+            #     reward += 200.0   # example
 
-        target = torch.tensor(reward) if done else torch.tensor(reward) + 0.99 * next_value
+        # Target (TD target)
+        target = torch.tensor(reward, dtype=torch.float32)
+        if not done:
+            target = target + 0.99 * next_value
 
-        if state is None:
-            advantage = target - self.last_next_value
-            actor_loss = torch.tensor(0.0)
-            critic_loss = F.mse_loss(self.last_next_value, target)
-            entropy = torch.tensor(0.0)
-        else:
-            advantage = target - self.last_value
-            actor_loss = -self.last_log_prob * advantage.detach()
+        # ─── Agent's turn case ────────────────────────────────────────
+        if state is not None:
+            advantage   = target - self.last_value
+            actor_loss  = -self.last_log_prob * advantage.detach()
             critic_loss = F.mse_loss(self.last_value, target)
-            entropy = -torch.sum(torch.softmax(self.last_logits, dim=0) * torch.log_softmax(self.last_logits, dim=0))
+            entropy     = -torch.sum(
+                F.softmax(self.last_logits, dim=0) * F.log_softmax(self.last_logits, dim=0)
+            )
 
+        # ─── Opponent's turn case ─────────────────────────────────────
+        else:
+            # Zero-sum view: opponent's good move is bad for us
+            reward = -reward
+            target = torch.tensor(reward, dtype=torch.float32)
+            if not done:
+                target += 0.99 * next_value
+
+            advantage   = target - self.last_opponent_value if self.last_opponent_value is not None else torch.tensor(0.0)
+            actor_loss  = torch.tensor(0.0, requires_grad=False)
+            critic_loss = F.mse_loss(self.last_opponent_value, target) if self.last_opponent_value is not None else torch.tensor(0.0)
+            entropy     = torch.tensor(0.0, requires_grad=False)
+
+        # Combine
         loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
+        # Update
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if loss.requires_grad:
+            loss.backward()           # ← no retain_graph=True needed in most cases
+            self.optimizer.step()
 
+        # Reset episode memory
         if done:
             self.hidden = (torch.zeros(1, 1, 128), torch.zeros(1, 1, 128))
+            self.last_value = None
+            self.last_log_prob = None
+            self.last_logits = None
+            self.last_opponent_value = None
+            self.last_state_value = None
 
-    def observe(self, state):
+    def observe(self, state: Dict):
+        """Optional: update hidden state without action selection"""
         state_vec = get_state_vec(state)
         with torch.no_grad():
             _, new_hidden = self.net(state_vec, None, self.hidden)
-        self.hidden = new_hidden
+        self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
 
-    def save(self, path):
+    def save(self, path: str):
         torch.save(self.net.state_dict(), path)
+
+    def load(self, path: str):
+        self.net.load_state_dict(torch.load(path))
+        self.net.eval()
