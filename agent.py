@@ -128,13 +128,10 @@ class ACAgent:
         return legal_actions[int(idx.item())]
 
     def learn(self, state, action, reward, next_state, done, info):
-        """
-        state is None   → opponent's turn just happened
-        state is not None → agent's turn just happened
-        """
-        reward = float(reward)  # very important
+        """Improved learn method - handles forced draw case safely"""
+        reward = float(reward)
 
-        # ─── Next value ───────────────────────────────────────────────
+        # Next state value estimation
         if next_state is not None:
             next_state_vec = get_state_vec(next_state)
             with torch.no_grad():
@@ -143,62 +140,61 @@ class ACAgent:
         else:
             next_value = torch.tensor(0.0, dtype=torch.float32)
 
-        # Terminal correction + joker penalty
-        if done:
-            # Joker penalty (our hand at the end)
-            jokers = 0
-            if next_state is not None and "my_hand" in next_state:
-                jokers = sum(1 for t in next_state["my_hand"] if t.tile_type == TileType.JOKER)
-            reward -= 30.0 * jokers
+        # Joker penalty + terminal shaping (only if agent lost the episode)
+        if done and next_state is not None:
+            jokers = sum(1 for t in next_state.get("my_hand", []) 
+                        if getattr(t, 'tile_type', None) == TileType.JOKER)
+            lost = False
+            if 'win_type' in info:
+                if info['win_type'] == 'emptied_hand':
+                    if len(next_state.get("my_hand", [])) > 0:
+                        # Opponent emptied hand → agent lost
+                        lost = True
+                elif info['win_type'] == 'lowest_hand':
+                    my_value = info.get('final_my_hand_value', 0)
+                    opp_value = info.get('final_opponent_hand_value', 0)
+                    if my_value > opp_value:
+                        # Agent has higher (worse) hand value → lost
+                        lost = True
+                # For 'tie', lost=False
+            if lost:
+                reward -= 30.0 * jokers  # Extra penalty only on loss
 
-            # Optional: other terminal shaping from info
-            # if 'win_type' in info and info['win_type'] == 'emptied_hand':
-            #     reward += 200.0   # example
-
-        # Target (TD target)
         target = torch.tensor(reward, dtype=torch.float32)
         if not done:
-            target = target + 0.99 * next_value
+            target += 0.99 * next_value
 
-        # ─── Agent's turn case ────────────────────────────────────────
-        if state is not None:
-            advantage   = target - self.last_value
-            actor_loss  = -self.last_log_prob * advantage.detach()
+        if state is not None and self.last_value is not None:
+            # Normal agent's turn (policy + critic update)
+            advantage = target - self.last_value
+            actor_loss = -self.last_log_prob * advantage.detach()
             critic_loss = F.mse_loss(self.last_value, target)
-            entropy     = -torch.sum(
-                F.softmax(self.last_logits, dim=0) * F.log_softmax(self.last_logits, dim=0)
-            )
-
-        # ─── Opponent's turn case ─────────────────────────────────────
+            entropy = -torch.sum(F.softmax(self.last_logits, dim=0) * 
+                                F.log_softmax(self.last_logits, dim=0))
         else:
-            # Zero-sum view: opponent's good move is bad for us
-            reward = -reward
-            target = torch.tensor(reward, dtype=torch.float32)
-            if not done:
-                target += 0.99 * next_value
+            # Opponent's turn OR forced draw → only critic update, no actor loss
+            actor_loss = torch.tensor(0.0)
+            if self.last_opponent_value is not None:
+                critic_loss = F.mse_loss(self.last_opponent_value, target)
+            else:
+                critic_loss = torch.tensor(0.0)
+            entropy = torch.tensor(0.0)
 
-            advantage   = target - self.last_opponent_value if self.last_opponent_value is not None else torch.tensor(0.0)
-            actor_loss  = torch.tensor(0.0, requires_grad=False)
-            critic_loss = F.mse_loss(self.last_opponent_value, target) if self.last_opponent_value is not None else torch.tensor(0.0)
-            entropy     = torch.tensor(0.0, requires_grad=False)
-
-        # Combine
         loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
-        # Update
         self.optimizer.zero_grad()
         if loss.requires_grad:
-            loss.backward()           # ← no retain_graph=True needed in most cases
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)  # Added gradient clipping
             self.optimizer.step()
 
-        # Reset episode memory
+        # Reset memory at end of episode
         if done:
             self.hidden = (torch.zeros(1, 1, 128), torch.zeros(1, 1, 128))
             self.last_value = None
             self.last_log_prob = None
             self.last_logits = None
             self.last_opponent_value = None
-            self.last_state_value = None
 
     def observe(self, state: Dict):
         """Optional: update hidden state without action selection"""

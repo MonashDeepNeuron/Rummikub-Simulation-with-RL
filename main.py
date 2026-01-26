@@ -17,6 +17,11 @@ from Baseline_Opponent2 import RummikubILPSolver
 from agent import ACAgent
 import matplotlib.pyplot as plt
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
 class TrainingStats:
     """Track training statistics."""
     
@@ -100,8 +105,8 @@ def train_agent(agent,
     """
     
     # Setup
-    env = RummikubEnv()
-    env.action_generator = ActionGenerator(mode=action_gen_mode, max_ilp_calls=50, max_window_size=7, timeout_seconds=45)
+    env = RummikubEnv(seed=None)  # Random seed for variety
+    env.action_generator = ActionGenerator(mode=action_gen_mode, max_ilp_calls=50, max_window_size=3, timeout_seconds=30)
     opponent = RummikubILPSolver()
     stats = TrainingStats()
     
@@ -134,15 +139,29 @@ def train_agent(agent,
         while not done:
             turn_count += 1
             
+            # ────────────────────────────────────────────────
+            #           ADDED: Log agent's hand value each turn (before action)
+            # ────────────────────────────────────────────────
+            agent_hand_value = sum(t.get_value() for t in env.player_hands[agent_player])
+            print(f"Episode {episode} | Turn {turn_count} | "
+                  f"Agent Player: {agent_player} | "
+                  f"Current Player: {env.current_player} | "
+                  f"Agent Hand Value: {agent_hand_value}")
+            
             if env.current_player == agent_player:
                 # Agent's turn
                 legal_actions = env.get_legal_actions(agent_player)
                 
                 if not legal_actions:
-                    print(f"WARNING: No legal actions for agent in episode {episode}")
-                    break
+                    print(f"WARNING: No legal actions found for agent in episode {episode}. Forcing draw.")
+                    action = RummikubAction(action_type='draw')
+                    # Set dummy values for learn
+                    agent.last_value = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+                    agent.last_log_prob = torch.tensor(0.0, requires_grad=False)
+                    agent.last_logits = torch.tensor([0.0], requires_grad=False)
+                else:
+                    action = agent.select_action(state, legal_actions)
                 
-                action = agent.select_action(state, legal_actions)
                 next_state, reward, done, info = env.step(action)
                 
                 # Agent learns from this experience
@@ -214,7 +233,7 @@ def evaluate_agent(agent,
         dict with evaluation metrics
     """
     env = RummikubEnv()
-    env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=75, max_window_size=9, timeout_seconds=30)
+    env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=75, max_window_size=4, timeout_seconds=30)  # FIXED: Reduce max_window_size to 4
     opponent = RummikubILPSolver()
     
     wins = 0
@@ -234,10 +253,12 @@ def evaluate_agent(agent,
         while not done:
             if env.current_player == agent_player:
                 legal_actions = env.get_legal_actions(agent_player)
-                action = agent.select_action(state, legal_actions)
+                if not legal_actions:
+                    action = RummikubAction(action_type='draw')  # FIXED: Force draw
+                else:
+                    action = agent.select_action(state, legal_actions)
                 state, reward, done, info = env.step(action)
             else:
-                # Opponent's turn
                 agent.pre_opponent_turn(state)
                 
                 action = opponent.solve(

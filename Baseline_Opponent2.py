@@ -196,6 +196,13 @@ class RummikubILPSolver:
             
             new_set = TileSet(tiles=set_tiles, set_type=meld.set_type)
             if not new_set.is_valid():
+                print("Invalid set detected in opponent solve:")
+                print(f"Template type: {meld.set_type}")
+                print(f"Template pattern: {meld.required_tiles}")
+                print(f"Assigned tiles: {[str(t) for t in set_tiles]}")
+                print(f"Tile IDs: {[t.tile_id for t in set_tiles]}")
+                print(f"Joker count: {sum(1 for t in set_tiles if t.tile_type == TileType.JOKER)}")
+                print(f"Non-joker tiles: {[str(t) for t in set_tiles if t.tile_type != TileType.JOKER]}")
                 raise ValueError("Generated invalid set.")
             new_sets.append(new_set)
         

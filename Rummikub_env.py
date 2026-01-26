@@ -245,43 +245,38 @@ class RummikubEnv:
             for color in Color:
                 for number in range(1, 14):
                     tile = Tile(color=color, number=number, 
-                            tile_type=TileType.NORMAL, tile_id=tile_id)
+                                tile_type=TileType.NORMAL, tile_id=tile_id)
                     self.tiles_deck.append(tile)
-                    tile_id += 1  # Make sure this is indented under the number loop
+                    tile_id += 1
         
         # Create 2 jokers
         for _ in range(2):
             tile = Tile(color=None, number=None, 
-                    tile_type=TileType.JOKER, tile_id=tile_id)
+                        tile_type=TileType.JOKER, tile_id=tile_id)
             self.tiles_deck.append(tile)
-            tile_id += 1  # This MUST be indented under the for _ in range(2): loop
-                        # If it's not indented (aligned with 'for'), both jokers get the same tile_id
+            tile_id += 1  # Must be indented under the loop (gives unique IDs: e.g., 104 and 105)
     
     def reset(self) -> Dict:
-        """Reset the environment for a new game"""
-        # Shuffle the deck
+        self.tiles_deck = []
+        print("Reset: Deck cleared (len=0)")
+        self._initialize_deck()
+        print(f"Reset: Deck initialized (len={len(self.tiles_deck)})")  # Should be 106
         self.rng.shuffle(self.tiles_deck)
-        
-        # Deal 14 tiles to each player
+        print(f"Reset: Deck shuffled (len={len(self.tiles_deck)})")  # Still 106
         self.player_hands = [[], []]
         for player in range(2):
-            self.player_hands[player] = self.tiles_deck[:14]
-            self.tiles_deck = self.tiles_deck[14:]
-        
-        # Reset game state
+            for _ in range(14):
+                tile = self.tiles_deck.pop()
+                self.player_hands[player].append(tile)
+        print(f"Reset: After deal - Hand 0 len={len(self.player_hands[0])}, Hand 1 len={len(self.player_hands[1])}, Deck len={len(self.tiles_deck)})")  # Hands 14 each, deck 78
+
         self.table = []
-        self.current_player = 0
+        self.current_player = self.rng.choice([0, 1])
         self.has_melded = [False, False]
         self.game_over = False
         self.winner = None
         self.turn_count = 0
-        
-        # Initialize hand values for reward calculation
-        self.previous_hand_values = [
-            self._calculate_hand_value(0),
-            self._calculate_hand_value(1)
-        ]
-        
+        self.previous_hand_values = [self._calculate_hand_value(i) for i in range(2)]
         return self._get_state()
     
     def _calculate_hand_value(self, player: int) -> int:
@@ -318,9 +313,7 @@ class RummikubEnv:
     def get_legal_actions(self, player: int) -> List[RummikubAction]:
         """
         Get all legal actions for the current player.
-        
-        TODO: This method should call your HybridActionGenerator.
-        
+
         Instructions:
         1. Create an instance of HybridActionGenerator (see separate file)
         2. Call: self.action_generator.generate_all_legal_actions(
@@ -328,35 +321,33 @@ class RummikubEnv:
                     table_sets=self.table,
                     has_melded=self.has_melded[player],
                     pool_size=len(self.tiles_deck)
-                 )
+                )
         3. The generator will return a list of RummikubAction objects
         
         For now, this returns basic actions for testing.
         """
-        legal_actions = []
+        # Use action generator if available (finish TODO: assume it's always set)
+        if self.action_generator is None:
+            raise ValueError("Action generator not set - must be initialized in env setup")
         
-        # Option 1: Draw a tile (always legal if pool not empty)
+        actions = self.action_generator.generate_all_legal_actions(
+            hand_tiles=self.player_hands[player],
+            table_sets=self.table,
+            has_melded=self.has_melded[player],
+            pool_size=len(self.tiles_deck)
+        )
+        
+        # Add logging for debugging
+        print(f"Player {player} legal actions: {len(actions)} (has_melded={self.has_melded[player]})")
+        if not actions:
+            print("  ℹ️  No valid plays found. (Ice broken? " 
+                  f"{self.has_melded[player]}, Hand value: {sum(t.get_value() for t in self.player_hands[player])})")
+        
+        # Always add 'draw' if pool not empty (as fallback)
         if len(self.tiles_deck) > 0:
-            legal_actions.append(RummikubAction(action_type='draw'))
+            actions.append(RummikubAction(action_type='draw'))
         
-        # Option 2: Use action generator if available
-        if self.action_generator is not None:
-            legal_actions.extend(
-                self.action_generator.generate_all_legal_actions(
-                    hand_tiles=self.player_hands[player],
-                    table_sets=self.table,
-                    has_melded=self.has_melded[player],
-                    pool_size=len(self.tiles_deck)
-                )
-            )
-        else:
-            # Fallback: basic action generation for testing
-            if self.has_melded[player]:
-                legal_actions.extend(self._find_valid_plays(player))
-            else:
-                legal_actions.extend(self._find_valid_initial_melds(player))
-        
-        return legal_actions
+        return actions
     
     def _find_valid_initial_melds(self, player: int) -> List[RummikubAction]:
         """
