@@ -240,21 +240,23 @@ class RummikubEnv:
         self.tiles_deck = []
         tile_id = 0
         
-        # Create numbered tiles (2 copies of each color-number combination)
+        # Numbered tiles (2 copies of each color-number combination)
         for copy in range(2):
             for color in Color:
                 for number in range(1, 14):
                     tile = Tile(color=color, number=number, 
                                 tile_type=TileType.NORMAL, tile_id=tile_id)
                     self.tiles_deck.append(tile)
-                    tile_id += 1
+                    tile_id += 1  # Indented under number loop
         
-        # Create 2 jokers
+        # Create 2 jokers with unique IDs
         for _ in range(2):
             tile = Tile(color=None, number=None, 
                         tile_type=TileType.JOKER, tile_id=tile_id)
-            self.tiles_deck.append(tile)
-            tile_id += 1  # Must be indented under the loop (gives unique IDs: e.g., 104 and 105)
+            self.tiles_deck.append(tile)  # Indented under joker loop
+            tile_id += 1  # Indented under joker loop (this ensures unique IDs: 104 and 105)
+            joker_ids = [t.tile_id for t in self.tiles_deck if t.tile_type == TileType.JOKER]
+            print(f"Joker IDs in deck: {joker_ids}")  # Should be [104, 105]
     
     def reset(self) -> Dict:
         self.tiles_deck = []

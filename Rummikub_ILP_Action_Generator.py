@@ -695,6 +695,15 @@ class RearrangementGenerator:
                     tt = p  # Already (Optional[int], Optional[int])
                     tiles_list = available_by_type[tt]
                     if not tiles_list:
+                        print("Tile assignment failed: insufficient tiles.")
+                        print(f"Template ID: {templ.template_id}")
+                        print(f"Template type: {templ.set_type}")
+                        print(f"Template pattern: {templ.pattern}")
+                        print(f"Current required tt: {tt}")
+                        print(f"Available by type for tt: {len(tiles_list)} (should be >0)")
+                        print(f"Total available types: {dict(available_by_type)}")  # Summarize counts
+                        print(f"Window tiles: {[str(t) for t in window_tiles]}")
+                        print(f"Connected hand: {[str(t) for t in connected_hand]}")
                         raise ValueError("Tile assignment failed: insufficient tiles.")
                     set_tiles.append(tiles_list.pop())
                 
