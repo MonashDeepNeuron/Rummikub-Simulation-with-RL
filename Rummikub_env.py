@@ -57,20 +57,9 @@ class TileSet:
     set_type: str  # "group" or "run"
     
     def is_valid(self) -> bool:
-        """Check if this set is valid according to Rummikub rules"""
-        if len(self.tiles) < 3:
+        tile_ids = np.array([t.tile_id for t in self.tiles])
+        if len(tile_ids) != len(np.unique(tile_ids)):
             return False
-        
-        # Check for duplicate tiles (same tile_id)
-        tile_ids = [t.tile_id for t in self.tiles]
-        if len(tile_ids) != len(set(tile_ids)):
-            return False  # Duplicate tiles not allowed!
-            
-        if self.set_type == "group":
-            return self._is_valid_group()
-        elif self.set_type == "run":
-            return self._is_valid_run()
-        return False
     
     def _is_valid_group(self) -> bool:
         """
@@ -281,9 +270,10 @@ class RummikubEnv:
         self.previous_hand_values = [self._calculate_hand_value(i) for i in range(2)]
         return self._get_state()
     
-    def _calculate_hand_value(self, player: int) -> int:
-        """Calculate total value of tiles in player's hand"""
-        return sum(tile.get_value() for tile in self.player_hands[player])
+    def _calculate_hand_value(self, player_id: int) -> int:
+        hand = np.array(self.player_hands[player_id])
+        values = np.array([t.get_value() for t in hand])  # Or store as array attr
+        return np.sum(values)
     
     def _count_jokers_in_hand(self, player: int) -> int:
         """Count number of jokers in player's hand"""

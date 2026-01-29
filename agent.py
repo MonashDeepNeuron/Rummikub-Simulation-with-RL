@@ -1,211 +1,313 @@
-# ac_agent.py
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from typing import List, Dict
-from Rummikub_env import RummikubAction, TileType, Color, RummikubEnv
+from typing import List, Dict, Tuple, Optional
+from collections import namedtuple
+from Rummikub_env import RummikubEnv, RummikubAction, TileType, Color
+from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
+from Baseline_Opponent2 import RummikubILPSolver
+
+# Store numpy arrays to avoid gradient issues
+Transition = namedtuple('Transition', (
+    'state_vec',      # numpy array
+    'action_idx',     # int or None
+    'action_vec',     # numpy array or None  
+    'reward',         # float
+    'next_state_vec', # numpy array or None
+    'done',           # bool
+    'info',           # dict
+    'num_actions'     # int
+))
+
 
 def get_state_vec(state: Dict) -> np.ndarray:
-    hand_counts = np.zeros(53)
-    for t in state['my_hand']:
-        if t.tile_type == TileType.JOKER:
-            hand_counts[52] += 1
-        else:
-            index = t.color.value * 13 + (t.number - 1)
-            hand_counts[index] += 1
-    table_counts = np.zeros(53)
+    """Convert game state to feature vector."""
+    hand = state['my_hand']
+    if len(hand) == 0:
+        hand_counts = np.zeros(53, dtype=np.float32)
+    else:
+        hand_types = np.array([t.tile_type.value for t in hand], dtype=np.int64)
+        hand_colors = np.array([t.color.value if t.color else 99 for t in hand], dtype=np.int64)
+        hand_numbers = np.array([t.number if t.number else 99 for t in hand], dtype=np.int64)
+        
+        hand_counts = np.zeros(53, dtype=np.float32)
+        joker_mask = hand_types == TileType.JOKER.value
+        hand_counts[52] = np.sum(joker_mask)
+        if np.any(~joker_mask):
+            non_joker_indices = (hand_colors * 13 + (hand_numbers - 1))[~joker_mask]
+            np.add.at(hand_counts, non_joker_indices, 1)
+    
+    all_table_tiles = []
     for s in state['table']:
-        for t in s.tiles:
-            if t.tile_type == TileType.JOKER:
-                table_counts[52] += 1
-            else:
-                index = t.color.value * 13 + (t.number - 1)
-                table_counts[index] += 1
+        all_table_tiles.extend(s.tiles)
+    
+    if len(all_table_tiles) == 0:
+        table_counts = np.zeros(53, dtype=np.float32)
+    else:
+        table_types = np.array([t.tile_type.value for t in all_table_tiles], dtype=np.int64)
+        table_colors = np.array([t.color.value if t.color else 99 for t in all_table_tiles], dtype=np.int64)
+        table_numbers = np.array([t.number if t.number else 99 for t in all_table_tiles], dtype=np.int64)
+        
+        table_counts = np.zeros(53, dtype=np.float32)
+        table_joker_mask = table_types == TileType.JOKER.value
+        table_counts[52] = np.sum(table_joker_mask)
+        if np.any(~table_joker_mask):
+            table_non_joker_indices = (table_colors * 13 + (table_numbers - 1))[~table_joker_mask]
+            np.add.at(table_counts, table_non_joker_indices, 1)
+    
     opp_count = state['opponent_tile_count'] / 30.0
     pool_size = state['pool_size'] / 80.0
     has_melded = 1.0 if state['has_melded'][state['current_player']] else 0.0
     opp_has_melded = 1.0 if state['has_melded'][1 - state['current_player']] else 0.0
+    
     vec = np.concatenate((hand_counts, table_counts, [opp_count, pool_size, has_melded, opp_has_melded]))
-    return vec
+    return vec.astype(np.float32)
+
 
 def get_action_vec(action: RummikubAction) -> np.ndarray:
-    played_counts = np.zeros(53)
-    for t in action.tiles:
-        if t.tile_type == TileType.JOKER:
-            played_counts[52] += 1
-        else:
-            index = t.color.value * 13 + (t.number - 1)
-            played_counts[index] += 1
+    """Convert action to feature vector."""
+    tiles = action.tiles if action.tiles else []
+    if len(tiles) == 0:
+        played_counts = np.zeros(53, dtype=np.float32)
+    else:
+        types = np.array([t.tile_type == TileType.JOKER for t in tiles])
+        colors = np.array([t.color.value if t.color else 99 for t in tiles], dtype=np.int64)
+        numbers = np.array([t.number if t.number else 99 for t in tiles], dtype=np.int64)
+        
+        played_counts = np.zeros(53, dtype=np.float32)
+        joker_mask = types
+        played_counts[52] = np.sum(joker_mask)
+        if np.any(~joker_mask):
+            non_joker_indices = (colors * 13 + (numbers - 1))[~joker_mask]
+            np.add.at(played_counts, non_joker_indices, 1)
+    
     flag_draw = 1.0 if action.action_type == 'draw' else 0.0
-    return np.concatenate((played_counts, [flag_draw]))
+    return np.concatenate((played_counts, [flag_draw])).astype(np.float32)
+
 
 class ActorCritic(nn.Module):
-    def __init__(self):
+    """Actor-Critic network with LSTM."""
+    
+    def __init__(self, hidden_size=256):
         super(ActorCritic, self).__init__()
-        self.lstm = nn.LSTM(110, 128, batch_first=False)
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(110, hidden_size, batch_first=True)
+        
         self.actor_head = nn.Sequential(
-            nn.Linear(128 + 54, 128),
+            nn.Linear(hidden_size + 54, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(hidden_size // 2, 1)
         )
+        
         self.critic_head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(hidden_size // 2, 1)
         )
 
-    def forward(self, state_vec, action_vecs, hidden):
-        input_lstm = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        out, new_hidden = self.lstm(input_lstm, hidden)
-        out = out.squeeze(0).squeeze(0)           # shape [128]
-
-        value = self.critic_head(out).squeeze(-1)  # shape []
+    def forward(self, state_vecs, action_vecs_list=None, hiddens=None):
+        batch_size = state_vecs.size(0)
         
-        if action_vecs is None:
-            return value, new_hidden
+        if hiddens is None:
+            hiddens = (torch.zeros(1, batch_size, self.hidden_size, device=state_vecs.device),
+                       torch.zeros(1, batch_size, self.hidden_size, device=state_vecs.device))
         
-        action_inputs = [torch.cat((out, torch.tensor(a_vec, dtype=torch.float32))) 
-                        for a_vec in action_vecs]
-        logits = torch.stack([self.actor_head(a_input) for a_input in action_inputs]).squeeze(1)
-        return value, logits, new_hidden
-
+        out, new_hiddens = self.lstm(state_vecs, hiddens)
+        out = out[:, -1, :]
+        
+        values = self.critic_head(out).squeeze(-1)
+        
+        if action_vecs_list is None:
+            return values, new_hiddens
+        
+        logits_list = []
+        for b in range(batch_size):
+            if action_vecs_list[b] is None or len(action_vecs_list[b]) == 0:
+                logits_list.append(None)
+                continue
+            
+            if isinstance(action_vecs_list[b], list):
+                action_vecs_stacked = torch.stack(action_vecs_list[b])
+            else:
+                action_vecs_stacked = action_vecs_list[b]
+            
+            num_actions = action_vecs_stacked.size(0)
+            state_repeated = out[b].unsqueeze(0).expand(num_actions, -1)
+            action_inputs = torch.cat([state_repeated, action_vecs_stacked], dim=1)
+            
+            logits = self.actor_head(action_inputs).squeeze(-1)
+            logits_list.append(logits)
+            
+        return values, logits_list, new_hiddens
 
 
 class ACAgent:
-    def __init__(self):
-        self.net = ActorCritic()
-        self.optimizer = optim.Adam(self.net.parameters(), lr=0.001)
-        self.hidden = (torch.zeros(1, 1, 128), torch.zeros(1, 1, 128))
-
+    """A3C Agent - FORCED TO CPU for shared memory compatibility."""
+    
+    def __init__(self, global_model=None, optimizer=None, is_worker=False):
+        # FORCE CPU for A3C shared memory compatibility
+        self.device = torch.device('cpu')
+        
+        self.local_net = ActorCritic().to(self.device)
+        self.global_model = global_model
+        self.optimizer = optimizer
+        self.is_worker = is_worker
+        
+        self.hidden = None
+        self.reset_hidden()
+        
         self.name = "ACAgent"
+        self.buffer: List[Transition] = []
+        self.batch_size = 32
+        self.gamma = 0.99
+        self.entropy_coef = 0.01
+        self.value_coef = 0.5
+        
+        if not is_worker and optimizer is None:
+            self.optimizer = optim.Adam(self.local_net.parameters(), lr=0.001)
 
-        # Buffers for last transition (agent's turn)
-        self.last_value      = None
-        self.last_log_prob   = None
-        self.last_logits     = None
+    def reset_hidden(self):
+        self.hidden = (
+            torch.zeros(1, 1, self.local_net.hidden_size, device=self.device),
+            torch.zeros(1, 1, self.local_net.hidden_size, device=self.device)
+        )
 
-        # For opponent's turn value estimation
-        self.last_opponent_value = None
+    def sync_local_to_global(self):
+        if self.global_model is not None:
+            self.local_net.load_state_dict(self.global_model.state_dict())
 
-        # Safety / reset flags
-        self.last_state_value    = None   # mostly unused now
-
-    def pre_opponent_turn(self, state: Dict):
-        """Called just before opponent acts → capture value estimate"""
-        state_vec = get_state_vec(state)
-        with torch.no_grad():
-            value, new_hidden = self.net(state_vec, None, self.hidden)
-        self.last_opponent_value = value
-        self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
-
-    def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> RummikubAction:
+    def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> Tuple[RummikubAction, int, List[np.ndarray]]:
+        """Select action. Returns (action, action_index, action_vecs_numpy)."""
         if not legal_actions:
-            return RummikubAction(action_type='draw') #Instead of raise, fallback to draw (safety net)
-
-        state_vec = get_state_vec(state)
-        action_vecs = [get_action_vec(a) for a in legal_actions]
-
-        value, logits, new_hidden = self.net(state_vec, action_vecs, self.hidden)
-
-        # Detach hidden to prevent long-term graph accumulation
-        self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
-
-        # Sample
-        dist = torch.distributions.Categorical(logits=logits)
-        idx = dist.sample()
-
-        # Save for learning
-        self.last_value     = value
-        self.last_log_prob  = dist.log_prob(idx)
-        self.last_logits    = logits
-
-        return legal_actions[int(idx.item())]
-
-    def learn(self, state, action, reward, next_state, done, info):
-        """Improved learn method - handles forced draw case safely"""
-        reward = float(reward)
-
-        # Next state value estimation
-        if next_state is not None:
-            next_state_vec = get_state_vec(next_state)
-            with torch.no_grad():
-                next_value, new_hidden = self.net(next_state_vec, None, self.hidden)
+            return RummikubAction(action_type='draw'), -1, []
+        
+        state_vec_np = get_state_vec(state)
+        state_vec = torch.from_numpy(state_vec_np).to(self.device).unsqueeze(0).unsqueeze(0)
+        
+        action_vecs_np = [get_action_vec(a) for a in legal_actions]
+        action_vecs = [torch.from_numpy(av).to(self.device) for av in action_vecs_np]
+        
+        with torch.no_grad():
+            _, logits_list, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
             self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
-        else:
-            next_value = torch.tensor(0.0, dtype=torch.float32)
+        
+        logits = logits_list[0]
+        
+        if logits is None or logits.numel() == 0:
+            return RummikubAction(action_type='draw'), -1, []
+        
+        probs = F.softmax(logits, dim=0)
+        dist = torch.distributions.Categorical(probs)
+        idx = dist.sample().item()
+        
+        return legal_actions[idx], idx, action_vecs_np
 
-        # Joker penalty + terminal shaping (only if agent lost the episode)
-        if done and next_state is not None:
-            jokers = sum(1 for t in next_state.get("my_hand", []) 
-                        if getattr(t, 'tile_type', None) == TileType.JOKER)
-            lost = False
-            if 'win_type' in info:
-                if info['win_type'] == 'emptied_hand':
-                    if len(next_state.get("my_hand", [])) > 0:
-                        # Opponent emptied hand → agent lost
-                        lost = True
-                elif info['win_type'] == 'lowest_hand':
-                    my_value = info.get('final_my_hand_value', 0)
-                    opp_value = info.get('final_opponent_hand_value', 0)
-                    if my_value > opp_value:
-                        # Agent has higher (worse) hand value → lost
-                        lost = True
-                # For 'tie', lost=False
-            if lost:
-                reward -= 30.0 * jokers  # Extra penalty only on loss
+    def store_transition(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
+        trans = Transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
+        self.buffer.append(trans)
 
-        target = torch.tensor(reward, dtype=torch.float32)
-        if not done:
-            target += 0.99 * next_value
+    def learn(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
+        self.store_transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
+        
+        if len(self.buffer) >= self.batch_size or done:
+            self._update_global()
 
-        if state is not None and self.last_value is not None:
-            # Normal agent's turn (policy + critic update)
-            advantage = target - self.last_value
-            actor_loss = -self.last_log_prob * advantage.detach()
-            critic_loss = F.mse_loss(self.last_value, target)
-            entropy = -torch.sum(F.softmax(self.last_logits, dim=0) * 
-                                F.log_softmax(self.last_logits, dim=0))
-        else:
-            # Opponent's turn OR forced draw → only critic update, no actor loss
-            actor_loss = torch.tensor(0.0)
-            if self.last_opponent_value is not None:
-                critic_loss = F.mse_loss(self.last_opponent_value, target)
-            else:
-                critic_loss = torch.tensor(0.0)
-            entropy = torch.tensor(0.0)
-
-        loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
-
+    def _update_global(self):
+        if not self.buffer or self.global_model is None:
+            self.buffer = []
+            return
+        
+        self.sync_local_to_global()
+        
+        batch_size = len(self.buffer)
+        
+        state_vecs = np.stack([t.state_vec for t in self.buffer])
+        rewards = torch.tensor([t.reward for t in self.buffer], dtype=torch.float32, device=self.device)
+        dones = torch.tensor([t.done for t in self.buffer], dtype=torch.float32, device=self.device)
+        
+        state_vecs_t = torch.from_numpy(state_vecs).to(self.device).unsqueeze(1)
+        
+        with torch.no_grad():
+            values_detached, _ = self.local_net(state_vecs_t, None)
+        
+        next_values = torch.zeros(batch_size, device=self.device)
+        for i, trans in enumerate(self.buffer):
+            if trans.next_state_vec is not None and not trans.done:
+                next_state_t = torch.from_numpy(trans.next_state_vec).to(self.device).unsqueeze(0).unsqueeze(0)
+                with torch.no_grad():
+                    nv, _ = self.local_net(next_state_t, None)
+                    next_values[i] = nv.squeeze()
+        
+        targets = rewards + self.gamma * next_values * (1 - dones)
+        
+        values_with_grad, _ = self.local_net(state_vecs_t, None)
+        
+        advantages = (targets - values_detached).detach()
+        
+        actor_loss = torch.tensor(0.0, device=self.device)
+        num_actor_samples = 0
+        
+        for i, trans in enumerate(self.buffer):
+            if trans.action_idx is None or trans.action_idx < 0 or trans.action_vec is None:
+                continue
+            if trans.num_actions <= 0:
+                continue
+            
+            state_t = torch.from_numpy(trans.state_vec).to(self.device).unsqueeze(0).unsqueeze(0)
+            action_t = torch.from_numpy(trans.action_vec).to(self.device).unsqueeze(0)
+            
+            temp_hidden = (torch.zeros(1, 1, self.local_net.hidden_size, device=self.device),
+                          torch.zeros(1, 1, self.local_net.hidden_size, device=self.device))
+            
+            _, logits_list, _ = self.local_net(state_t, [[action_t.squeeze(0)]], temp_hidden)
+            
+            if logits_list[0] is not None and logits_list[0].numel() > 0:
+                log_prob = F.log_softmax(logits_list[0], dim=0)[0]
+                actor_loss = actor_loss - log_prob * advantages[i]
+                num_actor_samples += 1
+        
+        if num_actor_samples > 0:
+            actor_loss = actor_loss / num_actor_samples
+        
+        critic_loss = F.mse_loss(values_with_grad, targets)
+        
+        loss = actor_loss + self.value_coef * critic_loss
+        
         self.optimizer.zero_grad()
-        if loss.requires_grad:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)  # Added gradient clipping
-            self.optimizer.step()
-
-        # Reset memory at end of episode
-        if done:
-            self.hidden = (torch.zeros(1, 1, 128), torch.zeros(1, 1, 128))
-            self.last_value = None
-            self.last_log_prob = None
-            self.last_logits = None
-            self.last_opponent_value = None
+        loss.backward()
+        
+        torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), 0.5)
+        
+        # Copy gradients to global model (both on CPU now)
+        for local_param, global_param in zip(self.local_net.parameters(), self.global_model.parameters()):
+            if local_param.grad is not None:
+                if global_param.grad is None:
+                    global_param.grad = local_param.grad.clone()
+                else:
+                    global_param.grad.copy_(local_param.grad)
+        
+        self.optimizer.step()
+        
+        self.buffer = []
 
     def observe(self, state: Dict):
-        """Optional: update hidden state without action selection"""
-        state_vec = get_state_vec(state)
+        state_vec_np = get_state_vec(state)
+        state_vec = torch.from_numpy(state_vec_np).to(self.device).unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
-            _, new_hidden = self.net(state_vec, None, self.hidden)
+            _, new_hidden = self.local_net(state_vec, None, self.hidden)
         self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
 
     def save(self, path: str):
-        torch.save(self.net.state_dict(), path)
+        model = self.global_model if self.global_model else self.local_net
+        torch.save(model.state_dict(), path)
 
     def load(self, path: str):
-        self.net.load_state_dict(torch.load(path))
-        self.net.eval()
+        model = self.global_model if self.global_model else self.local_net
+        model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+        model.eval()
