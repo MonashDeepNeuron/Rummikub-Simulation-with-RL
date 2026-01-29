@@ -57,10 +57,19 @@ class TileSet:
     set_type: str  # "group" or "run"
     
     def is_valid(self) -> bool:
-        tile_ids = np.array([t.tile_id for t in self.tiles])
-        if len(tile_ids) != len(np.unique(tile_ids)):
+        """Check if this tile set is a valid group or run."""
+        # Check for duplicate tile IDs
+        tile_ids = [t.tile_id for t in self.tiles]
+        if len(tile_ids) != len(set(tile_ids)):
             return False
-    
+        
+        # Call appropriate validation method based on set type
+        if self.set_type == "group":
+            return self._is_valid_group()
+        elif self.set_type == "run":
+            return self._is_valid_run()
+        else:
+            return False
     def _is_valid_group(self) -> bool:
         """
         Check if tiles form a valid group.
@@ -245,21 +254,21 @@ class RummikubEnv:
             self.tiles_deck.append(tile)  # Indented under joker loop
             tile_id += 1  # Indented under joker loop (this ensures unique IDs: 104 and 105)
             joker_ids = [t.tile_id for t in self.tiles_deck if t.tile_type == TileType.JOKER]
-            print(f"Joker IDs in deck: {joker_ids}")  # Should be [104, 105]
+            #print(f"Joker IDs in deck: {joker_ids}")  # Should be [104, 105]
     
     def reset(self) -> Dict:
         self.tiles_deck = []
-        print("Reset: Deck cleared (len=0)")
+        #print("Reset: Deck cleared (len=0)")
         self._initialize_deck()
-        print(f"Reset: Deck initialized (len={len(self.tiles_deck)})")  # Should be 106
+        #print(f"Reset: Deck initialized (len={len(self.tiles_deck)})")  # Should be 106
         self.rng.shuffle(self.tiles_deck)
-        print(f"Reset: Deck shuffled (len={len(self.tiles_deck)})")  # Still 106
+        #print(f"Reset: Deck shuffled (len={len(self.tiles_deck)})")  # Still 106
         self.player_hands = [[], []]
         for player in range(2):
             for _ in range(14):
                 tile = self.tiles_deck.pop()
                 self.player_hands[player].append(tile)
-        print(f"Reset: After deal - Hand 0 len={len(self.player_hands[0])}, Hand 1 len={len(self.player_hands[1])}, Deck len={len(self.tiles_deck)})")  # Hands 14 each, deck 78
+        #print(f"Reset: After deal - Hand 0 len={len(self.player_hands[0])}, Hand 1 len={len(self.player_hands[1])}, Deck len={len(self.tiles_deck)})")  # Hands 14 each, deck 78
 
         self.table = []
         self.current_player = self.rng.choice([0, 1])
@@ -347,9 +356,9 @@ class RummikubEnv:
         )
         
         # Add logging for debugging
-        print(f"Player {player} legal actions: {len(actions)} (has_melded={self.has_melded[player]})")
+        #print(f"Player {player} legal actions: {len(actions)} (has_melded={self.has_melded[player]})")
         if not actions:
-            print("  ℹ️  No valid plays found. (Ice broken? " 
+            print("  â„¹ï¸  No valid plays found. (Ice broken? " 
                   f"{self.has_melded[player]}, Hand value: {sum(t.get_value() for t in self.player_hands[player])})")
         
         # Always add 'draw' if pool not empty (as fallback)

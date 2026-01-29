@@ -96,13 +96,12 @@ class SuppressOutput:
 def worker_process(worker_id, global_model, optimizer, num_episodes, config, stats):
     """Worker process for A3C training."""
     
-    # Prefix for all prints from this worker
     prefix = f"[W{worker_id}]"
     
-    print(f"{prefix} Starting worker...")
+    # Create agent (will use GPU if available)
+    agent = ACAgent(global_model=global_model, optimizer=optimizer, is_worker=True, use_gpu=True)
     
-    # Create agent (CPU only for A3C)
-    agent = ACAgent(global_model=global_model, optimizer=optimizer, is_worker=True)
+    print(f"{prefix} Starting on {agent.device}...")
     
     # Create environment with suppressed output
     with SuppressOutput():
@@ -227,7 +226,7 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
         
         # Print episode summary
         print(f"{prefix} Ep {episode+1:3d}/{num_episodes} | {winner_str:9s} | "
-              f"R:{episode_reward:6.1f} | T:{turn_count:3d} | "
+              f"Reward:{episode_reward:6.1f} | Turns:{turn_count:3d} | "
               f"Agent(D:{agent_draws:2d} P:{agent_plays:2d}) Opp(D:{opp_draws:2d} P:{opp_plays:2d}) | "
               f"Ice:T{ice_broken_turn if ice_broken_turn > 0 else '-':>3}")
         
@@ -260,7 +259,14 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None):
     print(f"Workers: {num_workers}")
     print(f"Episodes per worker: {num_episodes_per_worker}")
     print(f"Total episodes: {num_workers * num_episodes_per_worker}")
-    print(f"Device: CPU (required for A3C shared memory)")
+    
+    # GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"GPU: {gpu_name} (workers use GPU, global model on CPU)")
+    else:
+        print(f"GPU: Not available (using CPU only)")
+    
     print(f"{'='*60}\n")
     
     start_time = time.time()

@@ -148,14 +148,17 @@ class ActorCritic(nn.Module):
 
 
 class ACAgent:
-    """A3C Agent - FORCED TO CPU for shared memory compatibility."""
+    """A3C Agent - Uses GPU for computation, CPU for shared global model."""
     
-    def __init__(self, global_model=None, optimizer=None, is_worker=False):
-        # FORCE CPU for A3C shared memory compatibility
-        self.device = torch.device('cpu')
+    def __init__(self, global_model=None, optimizer=None, is_worker=False, use_gpu=True):
+        # Use GPU for local computation if available
+        if use_gpu and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
         
         self.local_net = ActorCritic().to(self.device)
-        self.global_model = global_model
+        self.global_model = global_model  # Always on CPU for shared memory
         self.optimizer = optimizer
         self.is_worker = is_worker
         
@@ -164,7 +167,7 @@ class ACAgent:
         
         self.name = "ACAgent"
         self.buffer: List[Transition] = []
-        self.batch_size = 32
+        self.batch_size = 64  # Larger batch for GPU efficiency
         self.gamma = 0.99
         self.entropy_coef = 0.01
         self.value_coef = 0.5
@@ -179,8 +182,13 @@ class ACAgent:
         )
 
     def sync_local_to_global(self):
+        """Copy global model (CPU) weights to local model (GPU/CPU)."""
         if self.global_model is not None:
-            self.local_net.load_state_dict(self.global_model.state_dict())
+            # Load CPU state dict to local device
+            state_dict = self.global_model.state_dict()
+            # Move to local device
+            local_state_dict = {k: v.to(self.device) for k, v in state_dict.items()}
+            self.local_net.load_state_dict(local_state_dict)
 
     def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> Tuple[RummikubAction, int, List[np.ndarray]]:
         """Select action. Returns (action, action_index, action_vecs_numpy)."""
@@ -284,13 +292,15 @@ class ACAgent:
         
         torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), 0.5)
         
-        # Copy gradients to global model (both on CPU now)
+        # Copy gradients to global model (GPU -> CPU)
         for local_param, global_param in zip(self.local_net.parameters(), self.global_model.parameters()):
             if local_param.grad is not None:
+                # Move gradient to CPU before assigning to global model
+                cpu_grad = local_param.grad.cpu()
                 if global_param.grad is None:
-                    global_param.grad = local_param.grad.clone()
+                    global_param.grad = cpu_grad.clone()
                 else:
-                    global_param.grad.copy_(local_param.grad)
+                    global_param.grad.copy_(cpu_grad)
         
         self.optimizer.step()
         
