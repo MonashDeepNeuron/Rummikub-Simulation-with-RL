@@ -332,9 +332,26 @@ class RummikubEnv:
         if self.action_generator is None:
             raise ValueError("Action generator not set - must be initialized in env setup")
         
+        # CRITICAL: Check for table corruption BEFORE generating actions
+        all_table_tile_ids = [t.tile_id for ts in self.table for t in ts.tiles]
+        if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
+            from collections import Counter
+            counts = Counter(all_table_tile_ids)
+            duplicates = {tid: cnt for tid, cnt in counts.items() if cnt > 1}
+            print(f"CRITICAL ERROR: Table corruption detected! Duplicate tile_ids: {duplicates}")
+            print(f"Table state: {[[str(t) + f'({t.tile_id})' for t in ts.tiles] for ts in self.table]}")
+            # Return only draw action to allow game to continue
+            if len(self.tiles_deck) > 0:
+                return [RummikubAction(action_type='draw')]
+            return []
+        
+        # Pass a DEEP COPY of table to prevent corruption during generation
+        import copy
+        table_copy = copy.deepcopy(self.table)
+        
         actions = self.action_generator.generate_all_legal_actions(
             hand_tiles=self.player_hands[player],
-            table_sets=self.table,
+            table_sets=table_copy,
             has_melded=self.has_melded[player],
             pool_size=len(self.tiles_deck)
         )
@@ -424,8 +441,19 @@ class RummikubEnv:
                 info['invalid_action'] = True
             
         elif action.action_type == 'initial_meld':
+            # PRE-VALIDATION: Check for duplicate tiles in action.sets
+            if action.sets:
+                all_set_tile_ids = [t.tile_id for s in action.sets for t in s.tiles]
+                if len(all_set_tile_ids) != len(set(all_set_tile_ids)):
+                    from collections import Counter
+                    counts = Counter(all_set_tile_ids)
+                    dups = {k: v for k, v in counts.items() if v > 1}
+                    print(f"ERROR: initial_meld action has duplicate tile_ids in sets: {dups}")
+                    print(f"Sets: {[[f'{t}({t.tile_id})' for t in s.tiles] for s in action.sets]}")
+                    info['invalid_action'] = True
+            
             # Player makes initial meld
-            if self._validate_initial_meld(action):
+            if not info.get('invalid_action') and self._validate_initial_meld(action):
                 self._apply_meld(action)
                 self.has_melded[self.current_player] = True
                 info['ice_broken'] = True
@@ -435,11 +463,22 @@ class RummikubEnv:
                 info['invalid_action'] = True
                 
         elif action.action_type == 'play':
+            # PRE-VALIDATION: Check for duplicate tiles in action.table_config
+            if action.table_config:
+                all_config_tile_ids = [t.tile_id for s in action.table_config for t in s.tiles]
+                if len(all_config_tile_ids) != len(set(all_config_tile_ids)):
+                    from collections import Counter
+                    counts = Counter(all_config_tile_ids)
+                    dups = {k: v for k, v in counts.items() if v > 1}
+                    print(f"ERROR: play action has duplicate tile_ids in table_config: {dups}")
+                    print(f"Table config: {[[f'{t}({t.tile_id})' for t in s.tiles] for s in action.table_config]}")
+                    info['invalid_action'] = True
+            
             # Player plays tiles (after initial meld)
-            if self._validate_play(action):
+            if not info.get('invalid_action') and self._validate_play(action):
                 info['tiles_played'] = len(action.tiles)
                 # Check if manipulation occurred
-                if len(action.table_config) != len(self.table) + len(action.sets):
+                if len(action.table_config) != len(self.table) + len(action.sets if action.sets else []):
                     info['manipulation_occurred'] = True
                 self._apply_play(action)
             else:
@@ -584,9 +623,15 @@ class RummikubEnv:
         for tile_set in action.table_config:
             new_table_tiles.extend(tile_set.tiles)
         
+        # CRITICAL FIX: Check no duplicate tiles in new table configuration
+        # This prevents the same physical tile from appearing in multiple sets
+        new_table_tile_ids = [t.tile_id for t in new_table_tiles]
+        if len(new_table_tile_ids) != len(set(new_table_tile_ids)):
+            return False  # Duplicate tiles detected - invalid configuration!
+        
         # Tiles in new table should be: old table tiles + tiles played from hand
         expected_tile_ids = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
-        actual_tile_ids = set(t.tile_id for t in new_table_tiles)
+        actual_tile_ids = set(new_table_tile_ids)
         
         tiles_match = expected_tile_ids == actual_tile_ids
         
@@ -594,21 +639,47 @@ class RummikubEnv:
     
     def _apply_meld(self, action: RummikubAction):
         """Apply initial meld to game state"""
+        import copy
+        
         # Remove tiles from hand
         for tile in action.tiles:
             self.player_hands[self.current_player].remove(tile)
         
-        # Add sets to table
-        self.table.extend(action.sets)
+        # Add sets to table - CRITICAL: deep copy to avoid shared references
+        self.table.extend(copy.deepcopy(action.sets))
+        
+        # Validate no duplicate tiles on table
+        self._validate_table_integrity()
     
     def _apply_play(self, action: RummikubAction):
         """Apply a play to game state"""
+        import copy
+        
         # Remove tiles from hand
         for tile in action.tiles:
             self.player_hands[self.current_player].remove(tile)
         
-        # Update table with new configuration
-        self.table = action.table_config
+        # Update table with new configuration - CRITICAL: deep copy to avoid shared references
+        self.table = copy.deepcopy(action.table_config)
+        
+        # Validate no duplicate tiles on table
+        self._validate_table_integrity()
+    
+    def _validate_table_integrity(self):
+        """Ensure no tile appears multiple times on the table (would indicate a bug)"""
+        all_table_tile_ids = []
+        for tile_set in self.table:
+            for tile in tile_set.tiles:
+                all_table_tile_ids.append(tile.tile_id)
+        
+        if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
+            # Find duplicates for debugging
+            from collections import Counter
+            counts = Counter(all_table_tile_ids)
+            duplicates = {tid: cnt for tid, cnt in counts.items() if cnt > 1}
+            print(f"CRITICAL ERROR: Duplicate tiles detected on table after action: {duplicates}")
+            print(f"Table state: {[[str(t) + f'({t.tile_id})' for t in ts.tiles] for ts in self.table]}")
+            raise ValueError(f"Table corruption detected: duplicate tile_ids {duplicates}")
     
     def render(self):
         """Print the current game state"""

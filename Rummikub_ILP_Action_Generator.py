@@ -304,10 +304,11 @@ class HandPlayGenerator:
                 total_value = sum(s.get_meld_value() for s in combo)
                 if total_value >= 30:
                     played_tiles = all_tiles
+                    # CRITICAL: Deep copy the sets to avoid shared references between actions
                     action = RummikubAction(
                         action_type='initial_meld',
                         tiles=played_tiles,
-                        sets=list(combo)
+                        sets=[copy.deepcopy(s) for s in combo]
                     )
                     actions.append(action)
         
@@ -330,7 +331,13 @@ class HandPlayGenerator:
                     continue
                 
                 # New table = old table + new sets
-                new_table = copy.deepcopy(table) + list(combo)
+                # CRITICAL: Deep copy both table AND the combo sets to avoid shared references
+                new_table = copy.deepcopy(table) + [copy.deepcopy(s) for s in combo]
+                
+                # Validate no duplicate tile_ids in final table
+                all_table_tile_ids = [t.tile_id for ts in new_table for t in ts.tiles]
+                if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
+                    continue  # Skip - has duplicates
                 
                 action = RummikubAction(
                     action_type='play',
@@ -441,11 +448,18 @@ class TableExtensionGenerator:
             connected = self._find_connectable_tiles(hand, tile_set)
             for num_add in range(1, len(connected) + 1):
                 for adds in combinations(connected, num_add):
-                    new_tiles = tile_set.tiles + list(adds)
+                    # CRITICAL: Deep copy the existing tiles to avoid shared references
+                    new_tiles = copy.deepcopy(tile_set.tiles) + list(adds)
                     new_set = TileSet(new_tiles, tile_set.set_type)
                     if new_set.is_valid():
                         new_table = copy.deepcopy(table)
                         new_table[set_idx] = new_set
+                        
+                        # Validate no duplicate tile_ids before creating action
+                        all_tile_ids = [t.tile_id for ts in new_table for t in ts.tiles]
+                        if len(all_tile_ids) != len(set(all_tile_ids)):
+                            continue  # Skip this action - has duplicates
+                        
                         action = RummikubAction(
                             'play',
                             tiles=list(adds),
@@ -633,8 +647,10 @@ class RearrangementGenerator:
         if num_templates == 0:
             return None
         
-        # Variables: x_j for each template (int, allow multiples if possible, but limit to 2 for safety)
-        x = [solver.IntVar(0, 2, f'x[{i}]') for i in range(num_templates)]
+        # Variables: x_j for each template (boolean - each template selected at most once)
+        # NOTE: Using BoolVar instead of IntVar(0,2) to prevent selecting same template twice,
+        # which would require 2x the tiles and cause duplicate tile_id assignment bugs
+        x = [solver.BoolVar(f'x[{i}]') for i in range(num_templates)]
         
         # y_tt: number of hand tiles of type tt used
         y = {tt: solver.IntVar(0, type_inventory[tt]['count_hand'], f'y[{tt}]') for tt in tile_types}
@@ -680,6 +696,18 @@ class RearrangementGenerator:
         # All used tiles: window + played
         all_used_tiles = window_tiles + played_tiles
         
+        # SAFETY CHECK: Verify no duplicate tile_ids in all_used_tiles
+        # This catches edge cases where the same tile appears multiple times
+        all_tile_ids = [t.tile_id for t in all_used_tiles]
+        if len(all_tile_ids) != len(set(all_tile_ids)):
+            # Find duplicates for debugging
+            seen = set()
+            duplicates = [tid for tid in all_tile_ids if tid in seen or seen.add(tid)]
+            print(f"WARNING: Duplicate tile_ids detected in all_used_tiles: {duplicates}")
+            print(f"Window tiles: {[(str(t), t.tile_id) for t in window_tiles]}")
+            print(f"Played tiles: {[(str(t), t.tile_id) for t in played_tiles]}")
+            return None  # Skip this action - invalid state
+        
         # Available tiles by type
         available_by_type: Dict[Tuple[Optional[int], Optional[int]], List[Tile]] = defaultdict(list)
         for t in all_used_tiles:
@@ -704,7 +732,7 @@ class RearrangementGenerator:
                         print(f"Total available types: {dict(available_by_type)}")  # Summarize counts
                         print(f"Window tiles: {[str(t) for t in window_tiles]}")
                         print(f"Connected hand: {[str(t) for t in connected_hand]}")
-                        raise ValueError("Tile assignment failed: insufficient tiles.")
+                        return None  # Return None instead of raising - skip this action
                     set_tiles.append(tiles_list.pop())
                 
                 # Sort runs
@@ -720,12 +748,19 @@ class RearrangementGenerator:
                     print(f"Tile IDs: {[t.tile_id for t in set_tiles]}")
                     print(f"Joker count: {sum(1 for t in set_tiles if t.tile_type == TileType.JOKER)}")
                     print(f"Non-joker tiles: {[str(t) for t in set_tiles if t.tile_type != TileType.JOKER]}")
-                    raise ValueError("Generated invalid set.")
+                    return None  # Return None instead of raising - skip this action
                 new_sets.append(new_set)
         
         # Build final table config: unchanged sets + new sets
-        final_table = [table[idx] for idx in range(len(table)) if idx not in table_indices]
+        # CRITICAL: Use deep copy for unchanged sets to prevent shared references
+        final_table = [copy.deepcopy(table[idx]) for idx in range(len(table)) if idx not in table_indices]
         final_table.extend(new_sets)
+        
+        # FINAL VALIDATION: Check no duplicate tile_ids across entire table
+        all_final_tile_ids = [t.tile_id for ts in final_table for t in ts.tiles]
+        if len(all_final_tile_ids) != len(set(all_final_tile_ids)):
+            print("WARNING: Final table config has duplicate tile_ids - rejecting action")
+            return None
         
         # Create action
         return RummikubAction(
@@ -827,5 +862,3 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print("TESTING COMPLETE!")
     print(f"{'='*70}\n")
-
-
