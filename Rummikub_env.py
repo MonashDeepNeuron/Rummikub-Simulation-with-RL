@@ -402,8 +402,9 @@ class RummikubEnv:
         2. Win by empty hand: R_T = 200 + sum of opponent's hand
         3. Win by lowest hand: R_T = +10
         4. Lose by lowest hand: R_T = -10
-        5. Ice-breaking bonus: +20
-        6. Drawing penalty: -5
+        5. Lose when opponent wins by empty hand: R_T = - (sum of my hand)
+        6. Ice-breaking bonus: +20
+        7. Drawing penalty: -5
         """
         if self.game_over:
             raise ValueError("Game is already over")
