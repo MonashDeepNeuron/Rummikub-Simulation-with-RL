@@ -313,19 +313,18 @@ class RummikubEnv:
     
     def get_legal_actions(self, player: int) -> List[RummikubAction]:
         """
-        Get all legal actions for the current player.
-
-        Instructions:
-        1. Create an instance of HybridActionGenerator (see separate file)
-        2. Call: self.action_generator.generate_all_legal_actions(
-                    hand_tiles=self.player_hands[player],
-                    table_sets=self.table,
-                    has_melded=self.has_melded[player],
-                    pool_size=len(self.tiles_deck)
-                )
-        3. The generator will return a list of RummikubAction objects
+        Get all legal actions for the specified player.
         
-        For now, this returns basic actions for testing.
+        Uses the ActionGenerator (from Rummikub_ILP_Action_Generator.py) which implements:
+        - Generator 1: Hand plays (new sets from hand only)
+        - Generator 2: Table extensions (add tiles to existing sets)
+        - Generator 3: Complex rearrangements (windowed ILP search)
+        
+        Returns:
+            List of RummikubAction objects. Always includes 'draw' if pool is not empty.
+        
+        Raises:
+            ValueError: If action_generator is not set on the environment.
         """
         # Use action generator if available (finish TODO: assume it's always set)
         if self.action_generator is None:
@@ -367,31 +366,6 @@ class RummikubEnv:
         
         return actions
     
-    def _find_valid_initial_melds(self, player: int) -> List[RummikubAction]:
-        """
-        TODO: This is a placeholder. Should be replaced by action generator.
-        
-        What you should do:
-        - Remove this method entirely, OR
-        - Keep it as a simple fallback for testing
-        
-        The HybridActionGenerator will handle this properly.
-        """
-        # Simple placeholder - just returns empty list
-        return []
-    
-    def _find_valid_plays(self, player: int) -> List[RummikubAction]:
-        """
-        TODO: This is a placeholder. Should be replaced by action generator.
-        
-        What you should do:
-        - Remove this method entirely, OR  
-        - Keep it as a simple fallback for testing
-        
-        The HybridActionGenerator will handle this properly.
-        """
-        # Simple placeholder - just returns empty list
-        return []
     
     def step(self, action: RummikubAction) -> Tuple[Dict, float, bool, Dict]:
         """
@@ -402,9 +376,8 @@ class RummikubEnv:
         2. Win by empty hand: R_T = 200 + sum of opponent's hand
         3. Win by lowest hand: R_T = +10
         4. Lose by lowest hand: R_T = -10
-        5. Lose when opponent wins by empty hand: R_T = - (sum of my hand)
-        6. Ice-breaking bonus: +20
-        7. Drawing penalty: -5
+        5. Ice-breaking bonus: +20
+        6. Drawing penalty: -5
         """
         if self.game_over:
             raise ValueError("Game is already over")
@@ -516,11 +489,12 @@ class RummikubEnv:
             self.winner = self.current_player
             done = True
             
-            # Terminal reward: 200 + opponent's hand value
+            # Terminal reward for WINNER: 200 + opponent's hand value
             opponent = 1 - self.current_player
             opponent_hand_value = self._calculate_hand_value(opponent)
             reward = 200 + opponent_hand_value
             
+            info['final_my_hand_value'] = 0
             info['final_opponent_hand_value'] = opponent_hand_value
             info['win_type'] = 'emptied_hand'
             info['winner'] = self.current_player
