@@ -3,13 +3,34 @@
 Main Training Script for Rummikub RL Agent with A3C
 
 Reward function:
-1. R_t = (Sum of hand at t-1) - (Sum of hand at t)
-2. Win by empty hand: R_T = 200 + sum of opponent's hand
-3. Win by lowest hand (pool empty, neither can play): R_T = +10
-4. Lose by lowest hand: R_T = -10
-5. Lose when opponent wins by empty hand: R_T = -(sum of my hand)
-6. Ice-breaking bonus: +20
-7. Drawing penalty: -5
+Step rewards (accumulated during game):
+  1. R_t = (hand_value_before - hand_value_after)
+  2. Ice-breaking bonus: +20 (one-time, when agent first melds 30+ points)
+  3. Drawing penalty: -5
+
+Terminal rewards (at game end):
+  4. Win by empty hand: +200 + opponent_hand_value
+  5. Win by lowest hand (pool empty): +10
+  6. Lose when opponent empties hand: -(200 + my_hand_value)
+  7. Lose by lowest hand: -10
+
+Episode reward = sum of step rewards + terminal reward
+Terminal rewards are designed to dominate, ensuring:
+  - Winning -> positive total reward
+  - Losing -> negative total reward
+
+    Running:
+        Resume training from checkpoint: 
+            python main.py --checkpoint checkpoint_13.pth 
+
+        Resume training from checkpoint with custom settings:
+            python main.py --checkpoint checkpoint_13.pth --workers 3 --episodes 1000
+
+        Evaluate a checkpoint only (no training):
+            python main.py --checkpoint trained_agent_final.pth --eval-only 
+
+        Start fresh training (default):
+            python main.py
 """
 
 import numpy as np
@@ -111,13 +132,15 @@ def compute_agent_reward(env, agent_player, action, reward_from_env, done, info)
     Compute the reward from the AGENT's perspective.
     
     Reward function:
-    1. R_t = (Sum of hand at t-1) - (Sum of hand at t) for agent's actions
-    2. Win by empty hand: R_T = 200 + sum of opponent's hand
-    3. Win by lowest hand: R_T = +10
-    4. Lose by lowest hand: R_T = -10  
-    5. Lose when opponent wins by empty hand: R_T = -(sum of agent's hand)
-    6. Ice-breaking bonus: +20
-    7. Drawing penalty: -5
+    - Non-terminal steps: R_t = (hand_before - hand_after) [+ ice break +20] [- draw penalty 5]
+    - Win by empty hand: R_T = 200 + opponent_hand_value
+    - Win by lowest hand: R_T = +10
+    - Lose by opponent empty hand: R_T = -(my_hand_value)  # Symmetric with win
+    - Lose by lowest hand: R_T = -10
+    
+    The terminal rewards are designed to dominate intermediate rewards so that:
+    - Winning always results in positive total episode reward
+    - Losing always results in negative total episode reward
     """
     if done:
         winner = info.get('winner')
@@ -138,9 +161,8 @@ def compute_agent_reward(env, agent_player, action, reward_from_env, done, info)
             # Agent loses (winner is opponent)
             if win_type == 'emptied_hand':
                 # Lose when opponent empties hand: -(agent's hand value)
-                # From the environment's perspective at game end, agent's hand value is stored
-                # The winner emptied their hand, so agent still has cards
-                my_hand_value = info.get('final_opponent_hand_value', 0)  # This is agent's hand from winner's view
+                # This makes loss penalty symmetric with win bonus
+                my_hand_value = info.get('final_opponent_hand_value', 0)  # Agent's hand from winner's view
                 return -my_hand_value
             elif win_type == 'lowest_hand':
                 # Lose by lowest hand
@@ -180,7 +202,11 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
     
     print(f"{prefix} Initialized. Starting training...")
     
+    episode_times = []  # Track episode durations
+    
     for episode in range(num_episodes):
+        episode_start_time = time.time()
+        
         # Sync and reset
         agent.sync_local_to_global()
         agent.reset_hidden()
@@ -298,6 +324,8 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
             episode_reward = -100
         
         # Record stats
+        episode_time = time.time() - episode_start_time
+        episode_times.append(episode_time)
         stats.record_episode(env.winner, agent_player, episode_reward, turn_count)
         
         # Determine winner string
@@ -308,17 +336,18 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
         else:
             winner_str = "TIE"
         
-        # Print episode summary
+        # Print episode summary with timing
         ice_str = f"T{ice_broken_turn:3d}" if ice_broken_turn > 0 else "  -"
         print(f"{prefix} Ep {episode+1:3d}/{num_episodes} | {winner_str:9s} | "
               f"Reward:{episode_reward:7.1f} | Turns:{turn_count:3d} | "
-              f"Agent(D:{agent_draws:2d} P:{agent_plays:2d}) Opp(D:{opp_draws:2d} P:{opp_plays:2d}) | "
-              f"Ice:{ice_str}")
+              f"Agent(Draws:{agent_draws:2d} Play:{agent_plays:2d}) Opp(Draw:{opp_draws:2d} Play:{opp_plays:2d}) | "
+              f"Ice:{ice_str} | {episode_time:.1f}s")
         
         # Detailed stats every 25 episodes
         if (episode + 1) % 25 == 0:
             win_rate = stats.get_win_rate()
-            print(f"{prefix} === Global: {stats.episodes.value} eps, {win_rate:.1%} win rate ===")
+            avg_time = np.mean(episode_times[-25:]) if len(episode_times) >= 25 else np.mean(episode_times)
+            print(f"{prefix} === Global: {stats.episodes.value} eps, {win_rate:.1%} win rate, avg {avg_time:.1f}s/ep ===")
 
 
 def save_reward_plot(rewards, filename='training_rewards.png'):
@@ -361,8 +390,16 @@ def save_reward_plot(rewards, filename='training_rewards.png'):
     print(f"Saved reward plot to {filename}")
 
 
-def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None):
-    """Main A3C training function."""
+def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoint_path=None):
+    """
+    Main A3C training function.
+    
+    Args:
+        num_workers: Number of parallel worker processes
+        num_episodes_per_worker: Episodes each worker will run
+        config: Configuration dict (action_gen_mode, etc.)
+        checkpoint_path: Path to checkpoint.pth to resume training from (optional)
+    """
     
     if config is None:
         config = {
@@ -374,6 +411,15 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None):
     
     # Create global model (CPU for shared memory)
     global_model = ActorCritic()
+    
+    # Load checkpoint if provided
+    if checkpoint_path is not None:
+        print(f"\n{'='*60}")
+        print(f"LOADING CHECKPOINT: {checkpoint_path}")
+        print(f"{'='*60}")
+        global_model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
+        print(f"Successfully loaded weights from {checkpoint_path}")
+    
     global_model.share_memory()
     
     optimizer = optim.Adam(global_model.parameters(), lr=0.0001)
@@ -384,6 +430,8 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None):
     print(f"Workers: {num_workers}")
     print(f"Episodes per worker: {num_episodes_per_worker}")
     print(f"Total episodes: {num_workers * num_episodes_per_worker}")
+    if checkpoint_path:
+        print(f"Resuming from: {checkpoint_path}")
     
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
@@ -393,13 +441,15 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None):
     
     print(f"{'='*60}")
     print("Reward Function:")
-    print("  - Play tiles: (hand_before - hand_after)")
-    print("  - Draw: (hand_before - hand_after) - 5")
-    print("  - Ice break: +20 bonus")
-    print("  - Win (empty hand): 200 + opponent_hand_value")
-    print("  - Win (lowest hand): +10")
-    print("  - Lose (opponent empty): -my_hand_value")
-    print("  - Lose (lowest hand): -10")
+    print("  Step rewards (accumulated during game):")
+    print("    - Play tiles: (hand_before - hand_after)")
+    print("    - Draw: (hand_before - hand_after) - 5")
+    print("    - Ice break (one-time): +20 bonus")
+    print("  Terminal rewards (at game end):")
+    print("    - Win (empty hand): +200 + opponent_hand_value")
+    print("    - Win (lowest hand): +10")
+    print("    - Lose (opp empty): -(my_hand_value)")
+    print("    - Lose (lowest hand): -10")
     print(f"{'='*60}\n")
     
     start_time = time.time()
@@ -541,7 +591,34 @@ def evaluate_agent(agent, num_games=50):
 
 
 def main():
-    train_a3c(num_workers=4, num_episodes_per_worker=500)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='A3C Training for Rummikub')
+    parser.add_argument('--checkpoint', '-c', type=str, default=None,
+                        help='Path to checkpoint.pth to resume training from')
+    parser.add_argument('--workers', '-w', type=int, default=4,
+                        help='Number of worker processes (default: 4)')
+    parser.add_argument('--episodes', '-e', type=int, default=500,
+                        help='Episodes per worker (default: 500)')
+    parser.add_argument('--eval-only', action='store_true',
+                        help='Only evaluate the checkpoint, no training')
+    
+    args = parser.parse_args()
+    
+    if args.eval_only:
+        if args.checkpoint is None:
+            print("Error: --eval-only requires --checkpoint")
+            return
+        print(f"Evaluating checkpoint: {args.checkpoint}")
+        agent = ACAgent()
+        agent.load(args.checkpoint)
+        evaluate_agent(agent, num_games=100)
+    else:
+        train_a3c(
+            num_workers=args.workers,
+            num_episodes_per_worker=args.episodes,
+            checkpoint_path=args.checkpoint
+        )
 
 
 if __name__ == "__main__":

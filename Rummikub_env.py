@@ -465,7 +465,7 @@ class RummikubEnv:
         # Apply reward based on action type (as per user specification)
         if not info['invalid_action']:
             # Base reward: reduction in hand value
-            base_reward = hand_value_before - hand_value_after
+            base_reward = 3* (hand_value_before - hand_value_after)
             
             if action.action_type == 'draw':
                 # R_t = (hand_before - hand_after) - 5
