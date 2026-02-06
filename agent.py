@@ -22,6 +22,47 @@ Transition = namedtuple('Transition', (
 ))
 
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    """Training and reward configuration."""
+    
+    # Network Architecture
+    HIDDEN_SIZE = 512
+    NUM_LSTM_LAYERS = 2
+    DROPOUT = 0.1
+    LAYER_NORM = True
+    
+    # Learning Parameters
+    LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 1e-5
+    EXPLORATION_PROB = 0.02
+    GAMMA = 0.99
+    ENTROPY_COEF = 0.01
+    VALUE_COEF = 0.5
+    BATCH_SIZE = 64
+    
+    # Intermediate Rewards
+    REWARD_BASE_MULTIPLIER = 3.0        # 3 * (hand_before - hand_after)
+    REWARD_ICE_BREAK = 30.0             # +30 for initial meld
+    REWARD_TILE_EFFICIENCY = 2.0        # +2 per tile played
+    REWARD_TABLE_MANIPULATION = 5.0     # +5 if rearrangement occurred
+    REWARD_DRAW_PENALTY = -5.0          # -5 for drawing
+    
+    # Terminal Rewards
+    REWARD_WIN_EMPTY_HAND = 300.0       # +300 + opp_hand_value
+    REWARD_WIN_LOWEST_HAND = 50.0       # +50
+    REWARD_LOSE_EMPTY_HAND = -200.0     # -(200 + my_hand_value)
+    REWARD_LOSE_LOWEST_HAND = -75.0     # -75
+    
+    # Worker/Training Limits
+    MAX_TURNS = 200
+    TIMEOUT_SECONDS = 10.0
+    MAX_EPISODE_TIME = 600.0            # 10 minutes max per episode
+
+
 def get_state_vec(state: Dict) -> np.ndarray:
     """Convert game state to feature vector."""
     hand = state['my_hand']
@@ -88,38 +129,79 @@ def get_action_vec(action: RummikubAction) -> np.ndarray:
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic network with LSTM."""
+    """Actor-Critic network with 2-layer LSTM, dropout, and layer normalization."""
     
-    def __init__(self, hidden_size=256):
+    def __init__(self, hidden_size=None, num_layers=None, dropout=None, use_layer_norm=None):
         super(ActorCritic, self).__init__()
-        self.hidden_size = hidden_size
-        self.lstm = nn.LSTM(110, hidden_size, batch_first=True)
         
-        self.actor_head = nn.Sequential(
-            nn.Linear(hidden_size + 54, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1)
+        # Use Config defaults if not specified
+        self.hidden_size = hidden_size if hidden_size is not None else Config.HIDDEN_SIZE
+        self.num_layers = num_layers if num_layers is not None else Config.NUM_LSTM_LAYERS
+        dropout_rate = dropout if dropout is not None else Config.DROPOUT
+        use_ln = use_layer_norm if use_layer_norm is not None else Config.LAYER_NORM
+        
+        # Input layer normalization
+        self.input_ln = nn.LayerNorm(110) if use_ln else nn.Identity()
+        
+        # 2-layer LSTM with dropout
+        self.lstm = nn.LSTM(
+            input_size=110, 
+            hidden_size=self.hidden_size, 
+            num_layers=self.num_layers,
+            batch_first=True,
+            dropout=dropout_rate if self.num_layers > 1 else 0.0
         )
         
+        # Layer normalization after LSTM
+        self.lstm_ln = nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity()
+        
+        # Dropout layer
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        # Actor head (for action scoring)
+        self.actor_head = nn.Sequential(
+            nn.Linear(self.hidden_size + 54, self.hidden_size),
+            nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.LayerNorm(self.hidden_size // 2) if use_ln else nn.Identity(),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.hidden_size // 2, 1)
+        )
+        
+        # Critic head (for value estimation)
         self.critic_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity(),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.LayerNorm(self.hidden_size // 2) if use_ln else nn.Identity(),
             nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1)
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.hidden_size // 2, 1)
         )
 
     def forward(self, state_vecs, action_vecs_list=None, hiddens=None):
         batch_size = state_vecs.size(0)
         
         if hiddens is None:
-            hiddens = (torch.zeros(1, batch_size, self.hidden_size, device=state_vecs.device),
-                       torch.zeros(1, batch_size, self.hidden_size, device=state_vecs.device))
+            hiddens = (
+                torch.zeros(self.num_layers, batch_size, self.hidden_size, device=state_vecs.device),
+                torch.zeros(self.num_layers, batch_size, self.hidden_size, device=state_vecs.device)
+            )
         
-        out, new_hiddens = self.lstm(state_vecs, hiddens)
-        out = out[:, -1, :]
+        # Apply input layer norm
+        state_vecs_normed = self.input_ln(state_vecs)
+        
+        out, new_hiddens = self.lstm(state_vecs_normed, hiddens)
+        out = out[:, -1, :]  # Take last timestep
+        
+        # Apply layer norm and dropout after LSTM
+        out = self.lstm_ln(out)
+        out = self.dropout(out)
         
         values = self.critic_head(out).squeeze(-1)
         
@@ -167,18 +249,25 @@ class ACAgent:
         
         self.name = "ACAgent"
         self.buffer: List[Transition] = []
-        self.batch_size = 64  # Larger batch for GPU efficiency
-        self.gamma = 0.99
-        self.entropy_coef = 0.01
-        self.value_coef = 0.5
+        self.batch_size = Config.BATCH_SIZE
+        self.gamma = Config.GAMMA
+        self.entropy_coef = Config.ENTROPY_COEF
+        self.value_coef = Config.VALUE_COEF
+        self.exploration_prob = Config.EXPLORATION_PROB
         
         if not is_worker and optimizer is None:
-            self.optimizer = optim.Adam(self.local_net.parameters(), lr=0.001)
+            self.optimizer = optim.Adam(
+                self.local_net.parameters(), 
+                lr=Config.LEARNING_RATE,
+                weight_decay=Config.WEIGHT_DECAY
+            )
 
     def reset_hidden(self):
+        num_layers = self.local_net.num_layers
+        hidden_size = self.local_net.hidden_size
         self.hidden = (
-            torch.zeros(1, 1, self.local_net.hidden_size, device=self.device),
-            torch.zeros(1, 1, self.local_net.hidden_size, device=self.device)
+            torch.zeros(num_layers, 1, hidden_size, device=self.device),
+            torch.zeros(num_layers, 1, hidden_size, device=self.device)
         )
 
     def sync_local_to_global(self):
@@ -191,7 +280,7 @@ class ACAgent:
             self.local_net.load_state_dict(local_state_dict)
 
     def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> Tuple[RummikubAction, int, List[np.ndarray]]:
-        """Select action. Returns (action, action_index, action_vecs_numpy)."""
+        """Select action with epsilon-greedy exploration. Returns (action, action_index, action_vecs_numpy)."""
         if not legal_actions:
             return RummikubAction(action_type='draw'), -1, []
         
@@ -200,6 +289,16 @@ class ACAgent:
         
         action_vecs_np = [get_action_vec(a) for a in legal_actions]
         action_vecs = [torch.from_numpy(av).to(self.device) for av in action_vecs_np]
+        
+        # Epsilon-greedy exploration
+        if np.random.random() < self.exploration_prob:
+            # Random action
+            idx = np.random.randint(len(legal_actions))
+            # Still update hidden state
+            with torch.no_grad():
+                _, _, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
+                self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
+            return legal_actions[idx], idx, action_vecs_np
         
         with torch.no_grad():
             _, logits_list, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
@@ -270,8 +369,12 @@ class ACAgent:
             state_t = torch.from_numpy(trans.state_vec).to(self.device).unsqueeze(0).unsqueeze(0)
             action_t = torch.from_numpy(trans.action_vec).to(self.device).unsqueeze(0)
             
-            temp_hidden = (torch.zeros(1, 1, self.local_net.hidden_size, device=self.device),
-                          torch.zeros(1, 1, self.local_net.hidden_size, device=self.device))
+            num_layers = self.local_net.num_layers
+            hidden_size = self.local_net.hidden_size
+            temp_hidden = (
+                torch.zeros(num_layers, 1, hidden_size, device=self.device),
+                torch.zeros(num_layers, 1, hidden_size, device=self.device)
+            )
             
             _, logits_list, _ = self.local_net(state_t, [[action_t.squeeze(0)]], temp_hidden)
             

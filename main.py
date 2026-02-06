@@ -2,35 +2,38 @@
 """
 Main Training Script for Rummikub RL Agent with A3C
 
-Reward function:
-Step rewards (accumulated during game):
-  1. R_t = (hand_value_before - hand_value_after)
-  2. Ice-breaking bonus: +20 (one-time, when agent first melds 30+ points)
-  3. Drawing penalty: -5
+Reward function (using Config from agent.py):
+
+Intermediate rewards (after each agent turn):
+  1. Base: 3 * (hand_value_before - hand_value_after)
+  2. Ice-breaking bonus: +30 (one-time, when agent first melds 30+ points)
+  3. Tile efficiency: +2 per tile played
+  4. Table manipulation: +5 if rearrangement occurred
+  5. Drawing penalty: -5
 
 Terminal rewards (at game end):
-  4. Win by empty hand: +200 + opponent_hand_value
-  5. Win by lowest hand (pool empty): +10
-  6. Lose when opponent empties hand: -(200 + my_hand_value)
-  7. Lose by lowest hand: -10
+  6. Win by empty hand: +300 + opponent_hand_value + base_reward_for_winning_turn
+  7. Win by lowest hand (pool empty): +50
+  8. Lose when opponent empties hand: -(200 + my_hand_value)
+  9. Lose by lowest hand: -75
 
-Episode reward = sum of step rewards + terminal reward
-Terminal rewards are designed to dominate, ensuring:
-  - Winning -> positive total reward
-  - Losing -> negative total reward
+Reward timing:
+  - Agent's turn -> Agent receives R_t immediately after action
+  - Opponent's turn -> No reward for agent (just observe)
+  - Terminal: Add terminal bonus/penalty to final reward
 
-    Running:
-        Resume training from checkpoint: 
-            python main.py --checkpoint checkpoint_13.pth 
+Running:
+    Resume training from checkpoint: 
+        python main.py --checkpoint checkpoint_13.pth 
 
-        Resume training from checkpoint with custom settings:
-            python main.py --checkpoint checkpoint_13.pth --workers 3 --episodes 1000
+    Resume training from checkpoint with custom settings:
+        python main.py --checkpoint checkpoint_13.pth --workers 3 --episodes 1000
 
-        Evaluate a checkpoint only (no training):
-            python main.py --checkpoint trained_agent_final.pth --eval-only 
+    Evaluate a checkpoint only (no training):
+        python main.py --checkpoint trained_agent_final.pth --eval-only 
 
-        Start fresh training (default):
-            python main.py
+    Start fresh training (default):
+        python main.py
 """
 
 import numpy as np
@@ -43,7 +46,7 @@ import io
 from Rummikub_env import RummikubEnv, RummikubAction
 from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
 from Baseline_Opponent2 import RummikubILPSolver
-from agent import ACAgent, ActorCritic, get_state_vec, get_action_vec
+from agent import ACAgent, ActorCritic, Config, get_state_vec, get_action_vec
 
 import torch
 import torch.optim as optim
@@ -127,54 +130,87 @@ class SuppressOutput:
         sys.stderr = self._stderr
 
 
-def compute_agent_reward(env, agent_player, action, reward_from_env, done, info):
+def compute_intermediate_reward(action, info, hand_value_before, hand_value_after):
     """
-    Compute the reward from the AGENT's perspective.
+    Compute the intermediate reward for agent's turn.
     
-    Reward function:
-    - Non-terminal steps: R_t = (hand_before - hand_after) [+ ice break +20] [- draw penalty 5]
-    - Win by empty hand: R_T = 200 + opponent_hand_value
-    - Win by lowest hand: R_T = +10
-    - Lose by opponent empty hand: R_T = -(my_hand_value)  # Symmetric with win
-    - Lose by lowest hand: R_T = -10
-    
-    The terminal rewards are designed to dominate intermediate rewards so that:
-    - Winning always results in positive total episode reward
-    - Losing always results in negative total episode reward
+    Returns:
+        reward: float - the immediate reward after agent's action
     """
-    if done:
-        winner = info.get('winner')
-        win_type = info.get('win_type', '')
+    reward = 0.0
+    
+    # Base reward: 3 * (hand_before - hand_after)
+    base_reward = Config.REWARD_BASE_MULTIPLIER * (hand_value_before - hand_value_after)
+    reward += base_reward
+    
+    if action.action_type == 'draw':
+        # Drawing penalty
+        reward += Config.REWARD_DRAW_PENALTY
+    else:
+        # Tile efficiency: +2 per tile played
+        tiles_played = info.get('tiles_played', 0)
+        reward += Config.REWARD_TILE_EFFICIENCY * tiles_played
         
-        if winner == agent_player:
-            # Agent wins
-            if win_type == 'emptied_hand':
-                # Win by empty hand: 200 + opponent's hand value
-                opp_hand_value = info.get('final_opponent_hand_value', 0)
-                return 200 + opp_hand_value
-            elif win_type == 'lowest_hand':
-                # Win by lowest hand (tie-breaker)
-                return 10
-            else:
-                return 10  # Default win
-        elif winner is not None:
-            # Agent loses (winner is opponent)
-            if win_type == 'emptied_hand':
-                # Lose when opponent empties hand: -(agent's hand value)
-                # This makes loss penalty symmetric with win bonus
-                my_hand_value = info.get('final_opponent_hand_value', 0)  # Agent's hand from winner's view
-                return -my_hand_value
-            elif win_type == 'lowest_hand':
-                # Lose by lowest hand
-                return -10
-            else:
-                return -10  # Default loss
-        else:
-            # Tie
-            return 0
+        # Ice break bonus
+        if info.get('ice_broken', False):
+            reward += Config.REWARD_ICE_BREAK
+        
+        # Table manipulation bonus
+        if info.get('manipulation_occurred', False):
+            reward += Config.REWARD_TABLE_MANIPULATION
     
-    # Not terminal - return the reward from env (for agent's own actions)
-    return reward_from_env
+    return reward
+
+
+def compute_terminal_reward(env, agent_player, info, hand_value_before):
+    """
+    Compute the terminal reward when game ends.
+    
+    When agent wins by emptying hand:
+        R_T = base_reward_for_winning_turn + 300 + opponent_hand_value
+    
+    When agent loses (opponent empties hand):
+        R_T = -(200 + agent's_remaining_hand_value)
+    
+    Args:
+        env: RummikubEnv - the environment
+        agent_player: int - which player is the agent (0 or 1)
+        info: dict - info from env.step()
+        hand_value_before: float - agent's hand value before the final action
+    
+    Returns:
+        reward: float - the terminal reward
+    """
+    winner = info.get('winner')
+    win_type = info.get('win_type', '')
+    
+    if winner == agent_player:
+        # Agent wins
+        if win_type == 'emptied_hand':
+            # Win by empty hand: base_reward + 300 + opponent's hand value
+            # base_reward = 3 * (hand_before - 0) = 3 * hand_before
+            opp_hand_value = info.get('final_opponent_hand_value', 0)
+            base_reward = Config.REWARD_BASE_MULTIPLIER * hand_value_before
+            return base_reward + Config.REWARD_WIN_EMPTY_HAND + opp_hand_value
+        elif win_type == 'lowest_hand':
+            # Win by lowest hand (pool empty)
+            return Config.REWARD_WIN_LOWEST_HAND
+        else:
+            return Config.REWARD_WIN_LOWEST_HAND  # Default win
+    elif winner is not None:
+        # Agent loses (winner is opponent)
+        if win_type == 'emptied_hand':
+            # Lose when opponent empties hand: -(200 + agent's remaining hand value)
+            my_hand_value = info.get('final_my_hand_value', 0)
+            return Config.REWARD_LOSE_EMPTY_HAND - my_hand_value
+        elif win_type == 'lowest_hand':
+            # Lose by lowest hand
+            return Config.REWARD_LOSE_LOWEST_HAND
+        else:
+            return Config.REWARD_LOSE_LOWEST_HAND  # Default loss
+    else:
+        # Tie
+        return 0.0
 
 
 def worker_process(worker_id, global_model, optimizer, num_episodes, config, stats):
@@ -187,14 +223,14 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
     
     print(f"{prefix} Starting on {agent.device}...")
     
-    # Create environment
+    # Create environment with Config timeout
     with SuppressOutput():
         env = RummikubEnv()
         env.action_generator = ActionGenerator(
             mode=config['action_gen_mode'], 
             max_ilp_calls=50, 
             max_window_size=3, 
-            timeout_seconds=30
+            timeout_seconds=Config.TIMEOUT_SECONDS  # Use Config
         )
     
     # Create opponent
@@ -227,18 +263,28 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
         opp_plays = 0
         ice_broken_turn = -1
         
-        # Maximum turns to prevent infinite loops
-        MAX_TURNS = 500
+        # Track hand value for terminal reward calculation
+        agent_hand_value_before_turn = sum(t.get_value() for t in env.player_hands[agent_player])
         
         agent.observe(state)
         
-        while not done and turn_count < MAX_TURNS:
+        while not done and turn_count < Config.MAX_TURNS:
+            # Check episode time limit
+            if time.time() - episode_start_time > Config.MAX_EPISODE_TIME:
+                print(f"{prefix} WARNING: Episode {episode+1} hit time limit ({Config.MAX_EPISODE_TIME}s), forcing end")
+                episode_reward = -100
+                break
+            
             turn_count += 1
             current_player = env.current_player
             
             if current_player == agent_player:
                 # === AGENT'S TURN ===
                 state_vec = get_state_vec(state)
+                
+                # Track hand value before action
+                hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
+                agent_hand_value_before_turn = hand_value_before  # Save for potential terminal
                 
                 with SuppressOutput():
                     legal_actions = env.get_legal_actions(agent_player)
@@ -261,18 +307,23 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
                 
                 next_state, reward_env, done, info = env.step(action)
                 
-                # Compute agent's reward
-                if done:
-                    agent_reward = compute_agent_reward(env, agent_player, action, reward_env, done, info)
-                else:
-                    agent_reward = reward_env  # Use env reward for non-terminal
+                # Track hand value after action
+                hand_value_after = sum(t.get_value() for t in env.player_hands[agent_player])
                 
                 if info.get('ice_broken') and ice_broken_turn < 0:
                     ice_broken_turn = turn_count
                 
+                # Compute agent's reward
+                if done:
+                    # Terminal: compute terminal reward
+                    agent_reward = compute_terminal_reward(env, agent_player, info, hand_value_before)
+                else:
+                    # Intermediate: compute step reward
+                    agent_reward = compute_intermediate_reward(action, info, hand_value_before, hand_value_after)
+                
                 next_state_vec = get_state_vec(next_state) if not done else None
                 
-                # Learn with agent's reward
+                # Learn with agent's reward immediately after agent's turn
                 agent.learn(state_vec, action_idx, action_vec, agent_reward, next_state_vec, done, info, num_actions)
                 
                 # Accumulate agent's reward
@@ -305,7 +356,7 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
                 
                 # If game ends on opponent's turn, compute agent's terminal reward
                 if done:
-                    agent_reward = compute_agent_reward(env, agent_player, action, reward_env, done, info)
+                    agent_reward = compute_terminal_reward(env, agent_player, info, agent_hand_value_before_turn)
                     episode_reward += agent_reward
                     
                     # Learn the terminal transition
@@ -319,8 +370,8 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
                 state = next_state
         
         # Handle infinite loop case
-        if turn_count >= MAX_TURNS:
-            print(f"{prefix} WARNING: Episode {episode+1} hit max turns ({MAX_TURNS}), forcing end")
+        if turn_count >= Config.MAX_TURNS:
+            print(f"{prefix} WARNING: Episode {episode+1} hit max turns ({Config.MAX_TURNS}), forcing end")
             episode_reward = -100
         
         # Record stats
@@ -422,7 +473,12 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoin
     
     global_model.share_memory()
     
-    optimizer = optim.Adam(global_model.parameters(), lr=0.0001)
+    # Use Config learning rate and weight decay
+    optimizer = optim.Adam(
+        global_model.parameters(), 
+        lr=Config.LEARNING_RATE,
+        weight_decay=Config.WEIGHT_DECAY
+    )
     
     print(f"\n{'='*60}")
     print("A3C TRAINING - RUMMIKUB")
@@ -439,17 +495,27 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoin
     else:
         print(f"GPU: Not available (using CPU)")
     
+    print(f"\n{'='*60}")
+    print("CONFIGURATION (from Config class):")
     print(f"{'='*60}")
+    print(f"Network: hidden_size={Config.HIDDEN_SIZE}, lstm_layers={Config.NUM_LSTM_LAYERS}, dropout={Config.DROPOUT}, layer_norm={Config.LAYER_NORM}")
+    print(f"Learning: lr={Config.LEARNING_RATE}, weight_decay={Config.WEIGHT_DECAY}, exploration_prob={Config.EXPLORATION_PROB}")
+    print(f"Limits: max_turns={Config.MAX_TURNS}, timeout={Config.TIMEOUT_SECONDS}s, max_episode_time={Config.MAX_EPISODE_TIME}s")
+    
+    print(f"\n{'='*60}")
     print("Reward Function:")
-    print("  Step rewards (accumulated during game):")
-    print("    - Play tiles: (hand_before - hand_after)")
-    print("    - Draw: (hand_before - hand_after) - 5")
-    print("    - Ice break (one-time): +20 bonus")
+    print(f"{'='*60}")
+    print("  Intermediate rewards (after each agent turn):")
+    print(f"    - Base: {Config.REWARD_BASE_MULTIPLIER} * (hand_before - hand_after)")
+    print(f"    - Draw penalty: {Config.REWARD_DRAW_PENALTY}")
+    print(f"    - Ice break (one-time): +{Config.REWARD_ICE_BREAK} bonus")
+    print(f"    - Tile efficiency: +{Config.REWARD_TILE_EFFICIENCY} per tile played")
+    print(f"    - Table manipulation: +{Config.REWARD_TABLE_MANIPULATION} bonus")
     print("  Terminal rewards (at game end):")
-    print("    - Win (empty hand): +200 + opponent_hand_value")
-    print("    - Win (lowest hand): +10")
-    print("    - Lose (opp empty): -(my_hand_value)")
-    print("    - Lose (lowest hand): -10")
+    print(f"    - Win (empty hand): +{Config.REWARD_WIN_EMPTY_HAND} + opponent_hand_value + base_reward")
+    print(f"    - Win (lowest hand): +{Config.REWARD_WIN_LOWEST_HAND}")
+    print(f"    - Lose (opp empty): {Config.REWARD_LOSE_EMPTY_HAND} - my_hand_value")
+    print(f"    - Lose (lowest hand): {Config.REWARD_LOSE_LOWEST_HAND}")
     print(f"{'='*60}\n")
     
     start_time = time.time()
@@ -528,7 +594,12 @@ def evaluate_agent(agent, num_games=50):
     
     with SuppressOutput():
         env = RummikubEnv()
-        env.action_generator = ActionGenerator(mode=SolverMode.HYBRID, max_ilp_calls=50, max_window_size=3, timeout_seconds=30)
+        env.action_generator = ActionGenerator(
+            mode=SolverMode.HYBRID, 
+            max_ilp_calls=50, 
+            max_window_size=3, 
+            timeout_seconds=Config.TIMEOUT_SECONDS
+        )
     
     opponent = RummikubILPSolver()
     
@@ -549,9 +620,14 @@ def evaluate_agent(agent, num_games=50):
         agent.observe(state)
         
         turn = 0
-        while not done and turn < 500:
+        agent_hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
+        
+        while not done and turn < Config.MAX_TURNS:
             turn += 1
             if env.current_player == agent_player:
+                hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
+                agent_hand_value_before = hand_value_before
+                
                 with SuppressOutput():
                     legal_actions = env.get_legal_actions(agent_player)
                 if not legal_actions:
@@ -560,8 +636,12 @@ def evaluate_agent(agent, num_games=50):
                     action, _, _ = agent.select_action(state, legal_actions)
                 state, reward, done, info = env.step(action)
                 
+                hand_value_after = sum(t.get_value() for t in env.player_hands[agent_player])
+                
                 if done:
-                    game_reward = compute_agent_reward(env, agent_player, action, reward, done, info)
+                    game_reward = compute_terminal_reward(env, agent_player, info, hand_value_before)
+                else:
+                    game_reward += compute_intermediate_reward(action, info, hand_value_before, hand_value_after)
             else:
                 action = opponent.solve(env.player_hands[env.current_player], env.table, env.has_melded[env.current_player])
                 if action is None:
@@ -570,7 +650,7 @@ def evaluate_agent(agent, num_games=50):
                 agent.observe(state)
                 
                 if done:
-                    game_reward = compute_agent_reward(env, agent_player, action, reward, done, info)
+                    game_reward += compute_terminal_reward(env, agent_player, info, agent_hand_value_before)
         
         total_reward += game_reward
         
