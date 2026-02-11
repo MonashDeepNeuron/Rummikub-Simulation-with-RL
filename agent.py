@@ -9,62 +9,14 @@ from Rummikub_env import RummikubEnv, RummikubAction, TileType, Color
 from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
 from Baseline_Opponent2 import RummikubILPSolver
 
-# Store numpy arrays to avoid gradient issues
 Transition = namedtuple('Transition', (
-    'state_vec',      # numpy array
-    'action_idx',     # int or None
-    'action_vec',     # numpy array or None  
-    'reward',         # float
-    'next_state_vec', # numpy array or None
-    'done',           # bool
-    'info',           # dict
-    'num_actions'     # int
+    'state_vec', 'action_idx', 'action_vec', 'reward',
+    'next_state_vec', 'done', 'info', 'num_actions'
 ))
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-class Config:
-    """Training and reward configuration."""
-    
-    # Network Architecture
-    HIDDEN_SIZE = 512
-    NUM_LSTM_LAYERS = 2
-    DROPOUT = 0.1
-    LAYER_NORM = True
-    
-    # Learning Parameters
-    LEARNING_RATE = 0.001
-    WEIGHT_DECAY = 1e-5
-    EXPLORATION_PROB = 0.02
-    GAMMA = 0.99
-    ENTROPY_COEF = 0.01
-    VALUE_COEF = 0.5
-    BATCH_SIZE = 64
-    
-    # Intermediate Rewards
-    REWARD_BASE_MULTIPLIER = 3.0        # 3 * (hand_before - hand_after)
-    REWARD_ICE_BREAK = 30.0             # +30 for initial meld
-    REWARD_TILE_EFFICIENCY = 2.0        # +2 per tile played
-    REWARD_TABLE_MANIPULATION = 5.0     # +5 if rearrangement occurred
-    REWARD_DRAW_PENALTY = -5.0          # -5 for drawing
-    
-    # Terminal Rewards
-    REWARD_WIN_EMPTY_HAND = 300.0       # +300 + opp_hand_value
-    REWARD_WIN_LOWEST_HAND = 50.0       # +50
-    REWARD_LOSE_EMPTY_HAND = -200.0     # -(200 + my_hand_value)
-    REWARD_LOSE_LOWEST_HAND = -75.0     # -75
-    
-    # Worker/Training Limits
-    MAX_TURNS = 200
-    TIMEOUT_SECONDS = 10.0
-    MAX_EPISODE_TIME = 600.0            # 10 minutes max per episode
-
-
 def get_state_vec(state: Dict) -> np.ndarray:
-    """Convert game state to feature vector."""
+    """Convert game state to feature vector (110 dimensions)."""
     hand = state['my_hand']
     if len(hand) == 0:
         hand_counts = np.zeros(53, dtype=np.float32)
@@ -108,7 +60,7 @@ def get_state_vec(state: Dict) -> np.ndarray:
 
 
 def get_action_vec(action: RummikubAction) -> np.ndarray:
-    """Convert action to feature vector."""
+    """Convert action to feature vector (54 dimensions)."""
     tiles = action.tiles if action.tiles else []
     if len(tiles) == 0:
         played_counts = np.zeros(53, dtype=np.float32)
@@ -129,60 +81,78 @@ def get_action_vec(action: RummikubAction) -> np.ndarray:
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic network with 2-layer LSTM, dropout, and layer normalization."""
+    """Actor-Critic network with configurable LSTM."""
     
-    def __init__(self, hidden_size=None, num_layers=None, dropout=None, use_layer_norm=None):
+    def __init__(self, hidden_size=512, num_layers=2, dropout=0.1, use_layer_norm=True):
         super(ActorCritic, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.use_layer_norm = use_layer_norm
         
-        # Use Config defaults if not specified
-        self.hidden_size = hidden_size if hidden_size is not None else Config.HIDDEN_SIZE
-        self.num_layers = num_layers if num_layers is not None else Config.NUM_LSTM_LAYERS
-        dropout_rate = dropout if dropout is not None else Config.DROPOUT
-        use_ln = use_layer_norm if use_layer_norm is not None else Config.LAYER_NORM
+        # Input projection
+        self.input_proj = nn.Linear(110, hidden_size)
         
-        # Input layer normalization
-        self.input_ln = nn.LayerNorm(110) if use_ln else nn.Identity()
-        
-        # 2-layer LSTM with dropout
+        # LSTM for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=110, 
-            hidden_size=self.hidden_size, 
-            num_layers=self.num_layers,
+            hidden_size, hidden_size, 
+            num_layers=num_layers,
             batch_first=True,
-            dropout=dropout_rate if self.num_layers > 1 else 0.0
+            dropout=dropout if num_layers > 1 else 0.0
         )
         
-        # Layer normalization after LSTM
-        self.lstm_ln = nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity()
+        # Layer normalization
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(hidden_size)
+        else:
+            self.layer_norm = None
         
-        # Dropout layer
-        self.dropout = nn.Dropout(dropout_rate)
+        self.dropout = nn.Dropout(dropout)
         
-        # Actor head (for action scoring)
+        # Actor head: scores each action
         self.actor_head = nn.Sequential(
-            nn.Linear(self.hidden_size + 54, self.hidden_size),
-            nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity(),
+            nn.Linear(hidden_size + 54, hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.LayerNorm(self.hidden_size // 2) if use_ln else nn.Identity(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(self.hidden_size // 2, 1)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1)
         )
         
-        # Critic head (for value estimation)
+        # Critic head: estimates state value
         self.critic_head = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.LayerNorm(self.hidden_size) if use_ln else nn.Identity(),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.LayerNorm(self.hidden_size // 2) if use_ln else nn.Identity(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(self.hidden_size // 2, 1)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1)
         )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights properly."""
+        for name, param in self.lstm.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+        
+        for module in [self.input_proj, self.actor_head, self.critic_head]:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.xavier_uniform_(layer.weight)
+                        if layer.bias is not None:
+                            nn.init.zeros_(layer.bias)
 
     def forward(self, state_vecs, action_vecs_list=None, hiddens=None):
         batch_size = state_vecs.size(0)
@@ -193,21 +163,27 @@ class ActorCritic(nn.Module):
                 torch.zeros(self.num_layers, batch_size, self.hidden_size, device=state_vecs.device)
             )
         
-        # Apply input layer norm
-        state_vecs_normed = self.input_ln(state_vecs)
+        # Project input
+        x = self.input_proj(state_vecs)
+        x = F.relu(x)
         
-        out, new_hiddens = self.lstm(state_vecs_normed, hiddens)
-        out = out[:, -1, :]  # Take last timestep
+        # LSTM
+        out, new_hiddens = self.lstm(x, hiddens)
+        out = out[:, -1, :]  # Take last output
         
-        # Apply layer norm and dropout after LSTM
-        out = self.lstm_ln(out)
+        # Layer norm
+        if self.layer_norm is not None:
+            out = self.layer_norm(out)
+        
         out = self.dropout(out)
         
+        # Critic value
         values = self.critic_head(out).squeeze(-1)
         
         if action_vecs_list is None:
             return values, new_hiddens
         
+        # Actor logits for each action
         logits_list = []
         for b in range(batch_size):
             if action_vecs_list[b] is None or len(action_vecs_list[b]) == 0:
@@ -230,57 +206,67 @@ class ActorCritic(nn.Module):
 
 
 class ACAgent:
-    """A3C Agent - Uses GPU for computation, CPU for shared global model."""
+    """A3C Agent with exploration and improved learning."""
     
-    def __init__(self, global_model=None, optimizer=None, is_worker=False, use_gpu=True):
-        # Use GPU for local computation if available
+    # Hyperparameters (can be overridden by Config)
+    EXPLORATION_PROB = 0.05
+    GAMMA = 0.99
+    ENTROPY_COEF = 0.02
+    VALUE_COEF = 0.5
+    BATCH_SIZE = 64
+    GRAD_CLIP = 0.5
+    
+    def __init__(self, global_model=None, optimizer=None, is_worker=False, use_gpu=True,
+                 hidden_size=512, num_layers=2, dropout=0.1, use_layer_norm=True):
         if use_gpu and torch.cuda.is_available():
             self.device = torch.device('cuda')
         else:
             self.device = torch.device('cpu')
         
-        self.local_net = ActorCritic().to(self.device)
-        self.global_model = global_model  # Always on CPU for shared memory
+        self.local_net = ActorCritic(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            use_layer_norm=use_layer_norm
+        ).to(self.device)
+        
+        self.global_model = global_model
         self.optimizer = optimizer
         self.is_worker = is_worker
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         
         self.hidden = None
         self.reset_hidden()
         
         self.name = "ACAgent"
         self.buffer: List[Transition] = []
-        self.batch_size = Config.BATCH_SIZE
-        self.gamma = Config.GAMMA
-        self.entropy_coef = Config.ENTROPY_COEF
-        self.value_coef = Config.VALUE_COEF
-        self.exploration_prob = Config.EXPLORATION_PROB
+        self.batch_size = self.BATCH_SIZE
+        self.gamma = self.GAMMA
+        self.entropy_coef = self.ENTROPY_COEF
+        self.value_coef = self.VALUE_COEF
+        self.exploration_prob = self.EXPLORATION_PROB
         
         if not is_worker and optimizer is None:
-            self.optimizer = optim.Adam(
-                self.local_net.parameters(), 
-                lr=Config.LEARNING_RATE,
-                weight_decay=Config.WEIGHT_DECAY
-            )
+            self.optimizer = optim.Adam(self.local_net.parameters(), lr=0.001, weight_decay=1e-5)
 
     def reset_hidden(self):
-        num_layers = self.local_net.num_layers
-        hidden_size = self.local_net.hidden_size
+        """Reset LSTM hidden state."""
         self.hidden = (
-            torch.zeros(num_layers, 1, hidden_size, device=self.device),
-            torch.zeros(num_layers, 1, hidden_size, device=self.device)
+            torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device),
+            torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
         )
 
     def sync_local_to_global(self):
-        """Copy global model (CPU) weights to local model (GPU/CPU)."""
+        """Copy global model weights to local model."""
         if self.global_model is not None:
-            # Load CPU state dict to local device
             state_dict = self.global_model.state_dict()
-            # Move to local device
             local_state_dict = {k: v.to(self.device) for k, v in state_dict.items()}
             self.local_net.load_state_dict(local_state_dict)
 
     def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> Tuple[RummikubAction, int, List[np.ndarray]]:
-        """Select action with epsilon-greedy exploration. Returns (action, action_index, action_vecs_numpy)."""
+        """Select action using policy with epsilon-greedy exploration."""
         if not legal_actions:
             return RummikubAction(action_type='draw'), -1, []
         
@@ -292,14 +278,13 @@ class ACAgent:
         
         # Epsilon-greedy exploration
         if np.random.random() < self.exploration_prob:
-            # Random action
             idx = np.random.randint(len(legal_actions))
-            # Still update hidden state
             with torch.no_grad():
                 _, _, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
                 self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
             return legal_actions[idx], idx, action_vecs_np
         
+        # Policy-based selection
         with torch.no_grad():
             _, logits_list, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
             self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
@@ -316,16 +301,19 @@ class ACAgent:
         return legal_actions[idx], idx, action_vecs_np
 
     def store_transition(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
+        """Store transition in buffer."""
         trans = Transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
         self.buffer.append(trans)
 
     def learn(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
+        """Store transition and update when batch is full or episode ends."""
         self.store_transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
         
         if len(self.buffer) >= self.batch_size or done:
             self._update_global()
 
     def _update_global(self):
+        """Update global model using accumulated gradients."""
         if not self.buffer or self.global_model is None:
             self.buffer = []
             return
@@ -340,9 +328,11 @@ class ACAgent:
         
         state_vecs_t = torch.from_numpy(state_vecs).to(self.device).unsqueeze(1)
         
+        # Compute values (detached for TD target)
         with torch.no_grad():
             values_detached, _ = self.local_net(state_vecs_t, None)
         
+        # Compute next values for TD target
         next_values = torch.zeros(batch_size, device=self.device)
         for i, trans in enumerate(self.buffer):
             if trans.next_state_vec is not None and not trans.done:
@@ -351,13 +341,20 @@ class ACAgent:
                     nv, _ = self.local_net(next_state_t, None)
                     next_values[i] = nv.squeeze()
         
+        # TD targets
         targets = rewards + self.gamma * next_values * (1 - dones)
         
+        # Advantages (normalized)
+        advantages = (targets - values_detached).detach()
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Compute values with gradient
         values_with_grad, _ = self.local_net(state_vecs_t, None)
         
-        advantages = (targets - values_detached).detach()
-        
+        # Actor loss
         actor_loss = torch.tensor(0.0, device=self.device)
+        entropy_loss = torch.tensor(0.0, device=self.device)
         num_actor_samples = 0
         
         for i, trans in enumerate(self.buffer):
@@ -369,36 +366,46 @@ class ACAgent:
             state_t = torch.from_numpy(trans.state_vec).to(self.device).unsqueeze(0).unsqueeze(0)
             action_t = torch.from_numpy(trans.action_vec).to(self.device).unsqueeze(0)
             
-            num_layers = self.local_net.num_layers
-            hidden_size = self.local_net.hidden_size
             temp_hidden = (
-                torch.zeros(num_layers, 1, hidden_size, device=self.device),
-                torch.zeros(num_layers, 1, hidden_size, device=self.device)
+                torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device),
+                torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
             )
             
             _, logits_list, _ = self.local_net(state_t, [[action_t.squeeze(0)]], temp_hidden)
             
             if logits_list[0] is not None and logits_list[0].numel() > 0:
-                log_prob = F.log_softmax(logits_list[0], dim=0)[0]
+                log_probs = F.log_softmax(logits_list[0], dim=0)
+                probs = F.softmax(logits_list[0], dim=0)
+                
+                log_prob = log_probs[0]
                 actor_loss = actor_loss - log_prob * advantages[i]
+                
+                # Entropy bonus
+                entropy = -(probs * log_probs).sum()
+                entropy_loss = entropy_loss - entropy
+                
                 num_actor_samples += 1
         
         if num_actor_samples > 0:
             actor_loss = actor_loss / num_actor_samples
+            entropy_loss = entropy_loss / num_actor_samples
         
+        # Critic loss
         critic_loss = F.mse_loss(values_with_grad, targets)
         
-        loss = actor_loss + self.value_coef * critic_loss
+        # Total loss
+        loss = actor_loss + self.value_coef * critic_loss + self.entropy_coef * entropy_loss
         
+        # Backprop
         self.optimizer.zero_grad()
         loss.backward()
         
-        torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), 0.5)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.GRAD_CLIP)
         
         # Copy gradients to global model (GPU -> CPU)
         for local_param, global_param in zip(self.local_net.parameters(), self.global_model.parameters()):
             if local_param.grad is not None:
-                # Move gradient to CPU before assigning to global model
                 cpu_grad = local_param.grad.cpu()
                 if global_param.grad is None:
                     global_param.grad = cpu_grad.clone()
@@ -406,10 +413,10 @@ class ACAgent:
                     global_param.grad.copy_(cpu_grad)
         
         self.optimizer.step()
-        
         self.buffer = []
 
     def observe(self, state: Dict):
+        """Update LSTM hidden state by observing state (no action)."""
         state_vec_np = get_state_vec(state)
         state_vec = torch.from_numpy(state_vec_np).to(self.device).unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
@@ -417,10 +424,12 @@ class ACAgent:
         self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
 
     def save(self, path: str):
+        """Save model to file."""
         model = self.global_model if self.global_model else self.local_net
         torch.save(model.state_dict(), path)
 
     def load(self, path: str):
+        """Load model from file."""
         model = self.global_model if self.global_model else self.local_net
         model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
         model.eval()

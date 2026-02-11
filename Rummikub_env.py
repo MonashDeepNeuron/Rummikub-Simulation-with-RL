@@ -17,10 +17,10 @@ class TileType(Enum):
 @dataclass
 class Tile:
     """Represents a single Rummikub tile"""
-    color: Optional[Color]  # None for jokers
-    number: Optional[int]   # None for jokers, 1-13 for normal tiles
+    color: Optional[Color]
+    number: Optional[int]
     tile_type: TileType
-    tile_id: int  # Unique identifier for each physical tile
+    tile_id: int
     
     def __hash__(self):
         return hash(self.tile_id)
@@ -33,178 +33,95 @@ class Tile:
     def __repr__(self):
         if self.tile_type == TileType.JOKER:
             return "JOKER"
-        # Use different cases to distinguish colors:
-        # BLUE = lowercase 'b', BLACK = uppercase 'B'
-        # RED = 'R', ORANGE = 'O'
-        color_map = {
-            Color.RED: 'R',
-            Color.BLUE: 'b',      # lowercase for BLUE
-            Color.BLACK: 'B',     # uppercase for BLACK
-            Color.ORANGE: 'O'
-        }
+        color_map = {Color.RED: 'R', Color.BLUE: 'b', Color.BLACK: 'B', Color.ORANGE: 'O'}
         return f"{color_map[self.color]}{self.number}"
     
     def get_value(self) -> int:
-        """Returns the point value of the tile"""
         if self.tile_type == TileType.JOKER:
-            return 30  # Joker penalty
+            return 30
         return self.number
+
 
 @dataclass
 class TileSet:
-    """Represents a set of tiles on the table (either a group or a run)"""
+    """Represents a set of tiles on the table"""
     tiles: List[Tile]
     set_type: str  # "group" or "run"
     
     def is_valid(self) -> bool:
-        """Check if this tile set is a valid group or run."""
-        # Check for duplicate tile IDs
         tile_ids = [t.tile_id for t in self.tiles]
         if len(tile_ids) != len(set(tile_ids)):
             return False
-        
-        # Call appropriate validation method based on set type
         if self.set_type == "group":
             return self._is_valid_group()
         elif self.set_type == "run":
             return self._is_valid_run()
-        else:
-            return False
+        return False
+    
     def _is_valid_group(self) -> bool:
-        """
-        Check if tiles form a valid group.
-        Rules: 3-4 tiles, same number, different colors, no duplicates
-        """
         if len(self.tiles) < 3 or len(self.tiles) > 4:
             return False
-        
         numbers = []
         colors = []
-        joker_count = 0
-        
         for tile in self.tiles:
-            if tile.tile_type == TileType.JOKER:
-                joker_count += 1
-            else:
+            if tile.tile_type != TileType.JOKER:
                 numbers.append(tile.number)
                 colors.append(tile.color)
-        
-        # All non-joker tiles must have the same number
         if len(numbers) > 0 and len(set(numbers)) > 1:
             return False
-        
-        # All non-joker tiles must have different colors (no duplicates)
         if len(colors) != len(set(colors)):
             return False
-        
-        # A group can have at most 4 tiles (one per color)
-        if len(self.tiles) > 4:
-            return False
-        
         return True
     
     def _is_valid_run(self) -> bool:
-        """
-        Check if tiles form a valid run.
-        Rules: 3+ consecutive numbers, same color, no duplicates
-        """
         if len(self.tiles) < 3:
             return False
-        
         colors = []
         numbers = []
         joker_count = 0
-        
         for tile in self.tiles:
             if tile.tile_type == TileType.JOKER:
                 joker_count += 1
             else:
                 colors.append(tile.color)
                 numbers.append(tile.number)
-        
-        # All non-joker tiles must have the same color
         if len(colors) > 0 and len(set(colors)) > 1:
             return False
-        
-        # Check for duplicate numbers (can't have B7, B7 in same run)
         if len(numbers) != len(set(numbers)):
             return False
-        
-        # Check if numbers form a consecutive sequence
         if len(numbers) > 0:
             numbers.sort()
-            
-            min_num = numbers[0]
-            max_num = numbers[-1]
-            expected_length = max_num - min_num + 1
-            
-            # NEW: Allow jokers to extend ends by checking internal missing <= joker_count
-            # (instead of strict expected_length == len(self.tiles))
-            internal_missing = expected_length - len(numbers)
+            min_num, max_num = numbers[0], numbers[-1]
+            internal_missing = (max_num - min_num + 1) - len(numbers)
             if internal_missing > joker_count:
                 return False
-            
-            # Optional: Verify the exact missing within the span (for safety, though redundant with above)
-            all_numbers_in_range = set(range(min_num, max_num + 1))
-            missing_numbers = all_numbers_in_range - set(numbers)
-            
-            if len(missing_numbers) > joker_count:  # Updated from != to >
-                return False
-        
         return True
     
     def get_value(self) -> int:
-        """Returns the total value of tiles in this set (jokers count as 0)"""
-        total = 0
-        for tile in self.tiles:
-            if tile.tile_type == TileType.JOKER:
-                # For initial meld calculation, joker represents a tile value
-                # But for hand penalty, it's 30
-                # Here we return 0 and handle it contextually
-                total += 0
-            else:
-                total += tile.number
-        return total
+        return sum(t.number for t in self.tiles if t.tile_type != TileType.JOKER)
     
     def get_meld_value(self) -> int:
-        """
-        Returns value for initial meld purposes.
-        For initial meld, jokers take the value they represent.
-        """
         if self.set_type == "group":
-            # In a group, joker represents the same number as other tiles
-            non_joker_tiles = [t for t in self.tiles if t.tile_type != TileType.JOKER]
-            if non_joker_tiles:
-                number = non_joker_tiles[0].number
-                return number * len(self.tiles)
+            non_joker = [t for t in self.tiles if t.tile_type != TileType.JOKER]
+            if non_joker:
+                return non_joker[0].number * len(self.tiles)
             return 0
         elif self.set_type == "run":
-            # In a run, calculate the sum including joker values
-            total = 0
-            non_joker_tiles = [t for t in self.tiles if t.tile_type != TileType.JOKER]
-            if non_joker_tiles:
-                non_joker_tiles.sort(key=lambda t: t.number)
-                min_num = non_joker_tiles[0].number
-                max_num = non_joker_tiles[-1].number
-                # Sum of arithmetic sequence
-                expected_length = len(self.tiles)
-                actual_min = min_num - sum(1 for t in self.tiles[:self.tiles.index(non_joker_tiles[0])] 
-                                          if t.tile_type == TileType.JOKER)
-                total = sum(range(actual_min, actual_min + expected_length))
-            return total
+            non_joker = sorted([t for t in self.tiles if t.tile_type != TileType.JOKER], 
+                              key=lambda t: t.number)
+            if non_joker:
+                min_num = non_joker[0].number
+                jokers_before = sum(1 for t in self.tiles[:self.tiles.index(non_joker[0])] 
+                                   if t.tile_type == TileType.JOKER)
+                actual_min = min_num - jokers_before
+                return sum(range(actual_min, actual_min + len(self.tiles)))
+            return 0
         return 0
 
 
 class RummikubAction:
-    """Represents an action in Rummikub"""
     def __init__(self, action_type: str, tiles: List[Tile] = None, 
                  sets: List[TileSet] = None, table_config: List[TileSet] = None):
-        """
-        action_type: 'draw', 'initial_meld', 'play'
-        tiles: tiles from hand being played
-        sets: new sets being formed
-        table_config: complete table configuration after manipulation
-        """
         self.action_type = action_type
         self.tiles = tiles or []
         self.sets = sets or []
@@ -212,64 +129,87 @@ class RummikubAction:
 
 
 class RummikubEnv:
-    """Rummikub Environment for Reinforcement Learning"""
+    """
+    Rummikub Environment with ALL reward logic.
+    
+    REWARD CONFIGURATION (class variables):
+        REWARD_BASE_MULTIPLIER = 2.0
+        REWARD_ICE_BREAK = 30.0
+        REWARD_MANIPULATION = 10.0
+        REWARD_DRAW_PENALTY = -5.0
+        REWARD_WIN_EMPTY_HAND = 300.0
+        REWARD_WIN_LOWEST_HAND = 50.0
+        REWARD_LOSE_EMPTY_HAND = -200.0
+        REWARD_LOSE_LOWEST_HAND = -75.0
+    
+    REWARD FORMULA:
+        Acting player's turn (play/meld):
+            intermediate = BASE_MULTIPLIER * (hand_before - hand_after) + bonuses
+        
+        Acting player's turn (draw):
+            intermediate = BASE_MULTIPLIER * (hand_before - hand_after) + DRAW_PENALTY
+        
+        Terminal (acting player wins by empty hand):
+            acting_player_reward = intermediate + WIN_EMPTY_HAND + opponent_hand
+            opponent_reward = LOSE_EMPTY_HAND - opponent_hand  # ALWAYS < -200
+        
+        Terminal (acting player wins by lowest hand):
+            acting_player_reward = intermediate + WIN_LOWEST_HAND
+            opponent_reward = LOSE_LOWEST_HAND
+    
+    The step() function returns rewards for BOTH players:
+        info['reward_for_player_0']
+        info['reward_for_player_1']
+    
+    Use info['reward_for_player_{your_player_index}'] to get your reward.
+    """
+    
+    # =========================================================================
+    # REWARD CONFIGURATION - All reward params in ONE place
+    # =========================================================================
+    REWARD_BASE_MULTIPLIER = 2.0
+    REWARD_ICE_BREAK = 30.0
+    REWARD_MANIPULATION = 10.0
+    REWARD_DRAW_PENALTY = -5.0
+    REWARD_WIN_EMPTY_HAND = 300.0
+    REWARD_WIN_LOWEST_HAND = 50.0
+    REWARD_LOSE_EMPTY_HAND = -200.0
+    REWARD_LOSE_LOWEST_HAND = -75.0
     
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.RandomState(seed)
         self.tiles_deck: List[Tile] = []
-        self.player_hands: List[List[Tile]] = [[], []]  # 2 players
-        self.table: List[TileSet] = []  # Sets on the table
+        self.player_hands: List[List[Tile]] = [[], []]
+        self.table: List[TileSet] = []
         self.current_player: int = 0
-        self.has_melded: List[bool] = [False, False]  # Track initial meld
+        self.has_melded: List[bool] = [False, False]
         self.game_over: bool = False
         self.winner: Optional[int] = None
         self.turn_count: int = 0
-        
-        # For reward calculation
         self.previous_hand_values: List[int] = [0, 0]
-        
-        # Import the hybrid action generator (to be implemented)
-        self.action_generator = None  # Will be set externally
-        
+        self.action_generator = None
         self._initialize_deck()
     
     def _initialize_deck(self):
-        """Create the full deck of 106 tiles"""
         self.tiles_deck = []
         tile_id = 0
-        
-        # Numbered tiles (2 copies of each color-number combination)
-        for copy in range(2):
+        for _ in range(2):
             for color in Color:
                 for number in range(1, 14):
-                    tile = Tile(color=color, number=number, 
-                                tile_type=TileType.NORMAL, tile_id=tile_id)
-                    self.tiles_deck.append(tile)
-                    tile_id += 1  # Indented under number loop
-        
-        # Create 2 jokers with unique IDs
+                    self.tiles_deck.append(Tile(color, number, TileType.NORMAL, tile_id))
+                    tile_id += 1
         for _ in range(2):
-            tile = Tile(color=None, number=None, 
-                        tile_type=TileType.JOKER, tile_id=tile_id)
-            self.tiles_deck.append(tile)  # Indented under joker loop
-            tile_id += 1  # Indented under joker loop (this ensures unique IDs: 104 and 105)
-            joker_ids = [t.tile_id for t in self.tiles_deck if t.tile_type == TileType.JOKER]
-            #print(f"Joker IDs in deck: {joker_ids}")  # Should be [104, 105]
+            self.tiles_deck.append(Tile(None, None, TileType.JOKER, tile_id))
+            tile_id += 1
     
     def reset(self) -> Dict:
         self.tiles_deck = []
-        #print("Reset: Deck cleared (len=0)")
         self._initialize_deck()
-        #print(f"Reset: Deck initialized (len={len(self.tiles_deck)})")  # Should be 106
         self.rng.shuffle(self.tiles_deck)
-        #print(f"Reset: Deck shuffled (len={len(self.tiles_deck)})")  # Still 106
         self.player_hands = [[], []]
         for player in range(2):
             for _ in range(14):
-                tile = self.tiles_deck.pop()
-                self.player_hands[player].append(tile)
-        #print(f"Reset: After deal - Hand 0 len={len(self.player_hands[0])}, Hand 1 len={len(self.player_hands[1])}, Deck len={len(self.tiles_deck)})")  # Hands 14 each, deck 78
-
+                self.player_hands[player].append(self.tiles_deck.pop())
         self.table = []
         self.current_player = self.rng.choice([0, 1])
         self.has_melded = [False, False]
@@ -280,30 +220,17 @@ class RummikubEnv:
         return self._get_state()
     
     def _calculate_hand_value(self, player_id: int) -> int:
-        hand = np.array(self.player_hands[player_id])
-        values = np.array([t.get_value() for t in hand])  # Or store as array attr
-        return np.sum(values)
+        return sum(t.get_value() for t in self.player_hands[player_id])
     
     def _count_jokers_in_hand(self, player: int) -> int:
-        """Count number of jokers in player's hand"""
-        return sum(1 for tile in self.player_hands[player] 
-                   if tile.tile_type == TileType.JOKER)
+        return sum(1 for t in self.player_hands[player] if t.tile_type == TileType.JOKER)
     
     def _get_state(self) -> Dict:
-        """
-        Return the current game state as defined by user:
-        1. Board configuration and current player's hand
-        2. Number of tiles opponent has
-        3. Number of tiles to be drawn (pool size)
-        """
         return {
-            # Core state components
             'my_hand': copy.deepcopy(self.player_hands[self.current_player]),
             'table': copy.deepcopy(self.table),
             'opponent_tile_count': len(self.player_hands[1 - self.current_player]),
             'pool_size': len(self.tiles_deck),
-            
-            # Additional useful info
             'current_player': self.current_player,
             'has_melded': self.has_melded.copy(),
             'game_over': self.game_over,
@@ -312,394 +239,255 @@ class RummikubEnv:
         }
     
     def get_legal_actions(self, player: int) -> List[RummikubAction]:
-        """
-        Get all legal actions for the specified player.
-        
-        Uses the ActionGenerator (from Rummikub_ILP_Action_Generator.py) which implements:
-        - Generator 1: Hand plays (new sets from hand only)
-        - Generator 2: Table extensions (add tiles to existing sets)
-        - Generator 3: Complex rearrangements (windowed ILP search)
-        
-        Returns:
-            List of RummikubAction objects. Always includes 'draw' if pool is not empty.
-        
-        Raises:
-            ValueError: If action_generator is not set on the environment.
-        """
-        # Use action generator if available (finish TODO: assume it's always set)
         if self.action_generator is None:
-            raise ValueError("Action generator not set - must be initialized in env setup")
+            raise ValueError("Action generator not set")
         
-        # CRITICAL: Check for table corruption BEFORE generating actions
-        all_table_tile_ids = [t.tile_id for ts in self.table for t in ts.tiles]
-        if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
-            from collections import Counter
-            counts = Counter(all_table_tile_ids)
-            duplicates = {tid: cnt for tid, cnt in counts.items() if cnt > 1}
-            print(f"CRITICAL ERROR: Table corruption detected! Duplicate tile_ids: {duplicates}")
-            print(f"Table state: {[[str(t) + f'({t.tile_id})' for t in ts.tiles] for ts in self.table]}")
-            # Return only draw action to allow game to continue
+        all_ids = [t.tile_id for ts in self.table for t in ts.tiles]
+        if len(all_ids) != len(set(all_ids)):
             if len(self.tiles_deck) > 0:
                 return [RummikubAction(action_type='draw')]
             return []
         
-        # Pass a DEEP COPY of table to prevent corruption during generation
-        import copy
-        table_copy = copy.deepcopy(self.table)
-        
         actions = self.action_generator.generate_all_legal_actions(
             hand_tiles=self.player_hands[player],
-            table_sets=table_copy,
+            table_sets=copy.deepcopy(self.table),
             has_melded=self.has_melded[player],
             pool_size=len(self.tiles_deck)
         )
         
-        # Add logging for debugging
-        #print(f"Player {player} legal actions: {len(actions)} (has_melded={self.has_melded[player]})")
-        if not actions:
-            print("  â„¹ï¸  No valid plays found. (Ice broken? " 
-                  f"{self.has_melded[player]}, Hand value: {sum(t.get_value() for t in self.player_hands[player])})")
-        
-        # Always add 'draw' if pool not empty (as fallback)
         if len(self.tiles_deck) > 0:
             actions.append(RummikubAction(action_type='draw'))
         
         return actions
     
-    
     def step(self, action: RummikubAction) -> Tuple[Dict, float, bool, Dict]:
         """
-        Execute an action and return (state, reward, done, info)
+        Execute action and return (state, reward, done, info).
         
-        Updated reward function:
-        1. R_t = (Sum of hand at t-1) - (Sum of hand at t)
-        2. Win by empty hand: R_T = 200 + sum of opponent's hand
-        3. Win by lowest hand: R_T = +10
-        4. Lose by lowest hand: R_T = -10
-        5. Ice-breaking bonus: +20
-        6. Drawing penalty: -5
+        The 'reward' returned is from the ACTING PLAYER's perspective.
+        
+        CRITICAL: Use info['reward_for_player_X'] where X is YOUR player index
+        to get the correct reward for your agent.
         """
         if self.game_over:
             raise ValueError("Game is already over")
         
-        # Store hand value before action
-        hand_value_before = self._calculate_hand_value(self.current_player)
+        acting_player = self.current_player
+        opponent = 1 - acting_player
+        hand_value_before = self._calculate_hand_value(acting_player)
+        had_melded_before = self.has_melded[acting_player]
         
-        # Initialize info dictionary
         info = {
             'action_type': action.action_type,
             'tiles_played': 0,
             'drew_tile': False,
             'ice_broken': False,
-            'joker_retrieved': False,
             'manipulation_occurred': False,
-            'draw_penalty_applied': False,
             'invalid_action': False,
-            'hand_size_before': len(self.player_hands[self.current_player]),
+            'hand_size_before': len(self.player_hands[acting_player]),
             'hand_value_before': hand_value_before,
+            'acting_player': acting_player,
         }
-        
-        reward = 0
         
         # Execute action
         if action.action_type == 'draw':
-            # Draw a tile from the pool
             if len(self.tiles_deck) > 0:
-                drawn_tile = self.tiles_deck.pop(0)
-                self.player_hands[self.current_player].append(drawn_tile)
+                self.player_hands[acting_player].append(self.tiles_deck.pop(0))
                 info['drew_tile'] = True
-                info['draw_penalty_applied'] = True
             else:
-                # Invalid action - no tiles to draw
                 info['invalid_action'] = True
-            
+        
         elif action.action_type == 'initial_meld':
-            # PRE-VALIDATION: Check for duplicate tiles in action.sets
             if action.sets:
-                all_set_tile_ids = [t.tile_id for s in action.sets for t in s.tiles]
-                if len(all_set_tile_ids) != len(set(all_set_tile_ids)):
-                    from collections import Counter
-                    counts = Counter(all_set_tile_ids)
-                    dups = {k: v for k, v in counts.items() if v > 1}
-                    print(f"ERROR: initial_meld action has duplicate tile_ids in sets: {dups}")
-                    print(f"Sets: {[[f'{t}({t.tile_id})' for t in s.tiles] for s in action.sets]}")
+                all_ids = [t.tile_id for s in action.sets for t in s.tiles]
+                if len(all_ids) != len(set(all_ids)):
                     info['invalid_action'] = True
             
-            # Player makes initial meld
             if not info.get('invalid_action') and self._validate_initial_meld(action):
                 self._apply_meld(action)
-                self.has_melded[self.current_player] = True
+                self.has_melded[acting_player] = True
                 info['ice_broken'] = True
                 info['tiles_played'] = len(action.tiles)
             else:
-                # Invalid meld
                 info['invalid_action'] = True
-                
+        
         elif action.action_type == 'play':
-            # PRE-VALIDATION: Check for duplicate tiles in action.table_config
             if action.table_config:
-                all_config_tile_ids = [t.tile_id for s in action.table_config for t in s.tiles]
-                if len(all_config_tile_ids) != len(set(all_config_tile_ids)):
-                    from collections import Counter
-                    counts = Counter(all_config_tile_ids)
-                    dups = {k: v for k, v in counts.items() if v > 1}
-                    print(f"ERROR: play action has duplicate tile_ids in table_config: {dups}")
-                    print(f"Table config: {[[f'{t}({t.tile_id})' for t in s.tiles] for s in action.table_config]}")
+                all_ids = [t.tile_id for s in action.table_config for t in s.tiles]
+                if len(all_ids) != len(set(all_ids)):
                     info['invalid_action'] = True
             
-            # Player plays tiles (after initial meld)
             if not info.get('invalid_action') and self._validate_play(action):
                 info['tiles_played'] = len(action.tiles)
-                # Check if manipulation occurred
-                if len(action.table_config) != len(self.table) + len(action.sets if action.sets else []):
+                if len(action.table_config) != len(self.table) + len(action.sets or []):
                     info['manipulation_occurred'] = True
                 self._apply_play(action)
             else:
                 info['invalid_action'] = True
         
-        # Calculate hand value after action
-        hand_value_after = self._calculate_hand_value(self.current_player)
+        hand_value_after = self._calculate_hand_value(acting_player)
         info['hand_value_after'] = hand_value_after
-        info['hand_size_after'] = len(self.player_hands[self.current_player])
+        info['hand_size_after'] = len(self.player_hands[acting_player])
         
-        # Apply reward based on action type (as per user specification)
-        if not info['invalid_action']:
-            # Base reward: reduction in hand value
-            base_reward = 3* (hand_value_before - hand_value_after)
-            
-            if action.action_type == 'draw':
-                # R_t = (hand_before - hand_after) - 5
-                reward = base_reward - 5
-            elif action.action_type == 'initial_meld':
-                # R_t = (hand_before - hand_after) + 20
-                reward = base_reward + 20
-            elif action.action_type == 'play':
-                # R_t = (hand_before - hand_after)
-                reward = base_reward
-            else:
-                # Fallback
-                reward = base_reward
-        
-        # Check termination conditions
+        # =====================================================================
+        # REWARD CALCULATION - ALL LOGIC HERE
+        # =====================================================================
+        reward_for_player = [0.0, 0.0]
         done = False
         
-        # Condition 1: Current player has no tiles left (WIN by empty hand)
-        if len(self.player_hands[self.current_player]) == 0:
+        # Compute intermediate reward for acting player
+        if not info['invalid_action']:
+            hand_change = hand_value_before - hand_value_after
+            intermediate = self.REWARD_BASE_MULTIPLIER * hand_change
+            
+            if action.action_type == 'draw':
+                intermediate += self.REWARD_DRAW_PENALTY
+            else:
+                if info['ice_broken'] and not had_melded_before:
+                    intermediate += self.REWARD_ICE_BREAK
+                if info['manipulation_occurred']:
+                    intermediate += self.REWARD_MANIPULATION
+            
+            reward_for_player[acting_player] = intermediate
+        
+        # Check termination: acting player emptied hand
+        if len(self.player_hands[acting_player]) == 0:
             self.game_over = True
-            self.winner = self.current_player
+            self.winner = acting_player
             done = True
             
-            # Terminal reward for WINNER: 200 + opponent's hand value
-            opponent = 1 - self.current_player
             opponent_hand_value = self._calculate_hand_value(opponent)
-            reward = 200 + opponent_hand_value
             
             info['final_my_hand_value'] = 0
             info['final_opponent_hand_value'] = opponent_hand_value
             info['win_type'] = 'emptied_hand'
-            info['winner'] = self.current_player
+            info['winner'] = acting_player
+            
+            # Winner (acting player): intermediate + terminal
+            winner_terminal = self.REWARD_WIN_EMPTY_HAND + opponent_hand_value
+            reward_for_player[acting_player] += winner_terminal
+            
+            # Loser (opponent): ONLY terminal, no intermediate
+            # This is ALWAYS < REWARD_LOSE_EMPTY_HAND since opponent_hand_value > 0
+            loser_terminal = self.REWARD_LOSE_EMPTY_HAND - opponent_hand_value
+            reward_for_player[opponent] = loser_terminal
         
-        # Condition 2: No more tiles in pool
+        # Check termination: pool empty, no one can play
         elif len(self.tiles_deck) == 0:
-            # Check if anyone can make a move
-            current_can_play = len(self.get_legal_actions(self.current_player)) > 0  # FIXED: >0 instead of >1
-            next_player = 1 - self.current_player
+            current_can = len(self.get_legal_actions(acting_player)) > 0
             
-            # Switch to next player temporarily to check their actions
-            temp_current = self.current_player
-            self.current_player = next_player
-            next_can_play = len(self.get_legal_actions(next_player)) > 0  # FIXED: >0 instead of >1
-            self.current_player = temp_current
+            temp = self.current_player
+            self.current_player = opponent
+            next_can = len(self.get_legal_actions(opponent)) > 0
+            self.current_player = temp
             
-            # If neither player can play, game ends
-            if not current_can_play and not next_can_play:
+            if not current_can and not next_can:
                 self.game_over = True
                 done = True
                 
-                # Determine winner by lowest hand value
-                player_value = self._calculate_hand_value(self.current_player)
-                opponent_value = self._calculate_hand_value(1 - self.current_player)
+                p0_hand = self._calculate_hand_value(0)
+                p1_hand = self._calculate_hand_value(1)
                 
-                info['jokers_in_hand'] = self._count_jokers_in_hand(self.current_player)
-                info['final_my_hand_value'] = player_value
-                info['final_opponent_hand_value'] = opponent_value
+                info['final_my_hand_value'] = self._calculate_hand_value(acting_player)
+                info['final_opponent_hand_value'] = self._calculate_hand_value(opponent)
+                info['jokers_in_hand'] = self._count_jokers_in_hand(acting_player)
                 
-                if player_value < opponent_value:
-                    # Current player wins
-                    self.winner = self.current_player
-                    reward = 10  # Winner gets +10
+                if p0_hand < p1_hand:
+                    self.winner = 0
                     info['win_type'] = 'lowest_hand'
-                    info['winner'] = self.current_player
-                elif opponent_value < player_value:
-                    # Current player loses
-                    self.winner = 1 - self.current_player
-                    reward = -10  # Loser gets -10
+                    info['winner'] = 0
+                    reward_for_player[0] += self.REWARD_WIN_LOWEST_HAND
+                    reward_for_player[1] = self.REWARD_LOSE_LOWEST_HAND
+                elif p1_hand < p0_hand:
+                    self.winner = 1
                     info['win_type'] = 'lowest_hand'
-                    info['winner'] = 1 - self.current_player
+                    info['winner'] = 1
+                    reward_for_player[1] += self.REWARD_WIN_LOWEST_HAND
+                    reward_for_player[0] = self.REWARD_LOSE_LOWEST_HAND
                 else:
-                    # Tie - no winner
                     self.winner = None
-                    reward = 0
                     info['win_type'] = 'tie'
                     info['winner'] = None
         
-        # Update previous hand value for next turn
-        self.previous_hand_values[self.current_player] = hand_value_after
+        # CRITICAL: Store rewards for BOTH players
+        info['reward_for_player_0'] = reward_for_player[0]
+        info['reward_for_player_1'] = reward_for_player[1]
         
-        # Switch to next player
+        # Return reward from acting player's perspective (for compatibility)
+        reward = reward_for_player[acting_player]
+        
+        self.previous_hand_values[acting_player] = hand_value_after
+        
         if not done:
             self.current_player = 1 - self.current_player
             self.turn_count += 1
         
-        state = self._get_state()
-        return state, reward, done, info
+        return self._get_state(), reward, done, info
     
     def _validate_initial_meld(self, action: RummikubAction) -> bool:
-        """Validate that initial meld is legal (30+ points)"""
         if not action.sets:
             return False
-        
-        # Calculate total value (for initial meld, jokers count as their represented value)
-        total_value = sum(s.get_meld_value() for s in action.sets)
-        
-        # Check all sets are valid
-        all_valid = all(s.is_valid() for s in action.sets)
-        
-        # Check tiles come from player's hand
-        all_tiles_in_hand = all(t in self.player_hands[self.current_player] 
-                                for t in action.tiles)
-        
-        # Check no tiles are used from table (initial meld can't use table)
-        # action.table_config should only contain the new sets
-        
-        return total_value >= 30 and all_valid and all_tiles_in_hand
+        total = sum(s.get_meld_value() for s in action.sets)
+        valid = all(s.is_valid() for s in action.sets)
+        in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
+        return total >= 30 and valid and in_hand
     
     def _validate_play(self, action: RummikubAction) -> bool:
-        """Validate that a play is legal"""
-        # Check that all resulting sets on table are valid
         if action.table_config is None:
             return False
+        in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
+        valid = all(s.is_valid() for s in action.table_config)
         
-        # Check tiles come from player's hand
-        all_tiles_in_hand = all(t in self.player_hands[self.current_player] 
-                                for t in action.tiles)
+        table_tiles = [t for ts in self.table for t in ts.tiles]
+        new_tiles = [t for ts in action.table_config for t in ts.tiles]
+        new_ids = [t.tile_id for t in new_tiles]
         
-        # Check all sets in new configuration are valid
-        all_sets_valid = all(s.is_valid() for s in action.table_config)
+        if len(new_ids) != len(set(new_ids)):
+            return False
         
-        # Check that all tiles are accounted for (hand tiles + table tiles = new table tiles)
-        # Count tiles: tiles from table + tiles from hand = tiles in new table
-        table_tiles = []
-        for tile_set in self.table:
-            table_tiles.extend(tile_set.tiles)
+        expected = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
+        actual = set(new_ids)
         
-        new_table_tiles = []
-        for tile_set in action.table_config:
-            new_table_tiles.extend(tile_set.tiles)
-        
-        # CRITICAL FIX: Check no duplicate tiles in new table configuration
-        # This prevents the same physical tile from appearing in multiple sets
-        new_table_tile_ids = [t.tile_id for t in new_table_tiles]
-        if len(new_table_tile_ids) != len(set(new_table_tile_ids)):
-            return False  # Duplicate tiles detected - invalid configuration!
-        
-        # Tiles in new table should be: old table tiles + tiles played from hand
-        expected_tile_ids = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
-        actual_tile_ids = set(new_table_tile_ids)
-        
-        tiles_match = expected_tile_ids == actual_tile_ids
-        
-        return all_tiles_in_hand and all_sets_valid and tiles_match
+        return in_hand and valid and expected == actual
     
     def _apply_meld(self, action: RummikubAction):
-        """Apply initial meld to game state"""
-        import copy
-        
-        # Remove tiles from hand
-        for tile in action.tiles:
-            self.player_hands[self.current_player].remove(tile)
-        
-        # Add sets to table - CRITICAL: deep copy to avoid shared references
+        for t in action.tiles:
+            self.player_hands[self.current_player].remove(t)
         self.table.extend(copy.deepcopy(action.sets))
-        
-        # Validate no duplicate tiles on table
         self._validate_table_integrity()
     
     def _apply_play(self, action: RummikubAction):
-        """Apply a play to game state"""
-        import copy
-        
-        # Remove tiles from hand
-        for tile in action.tiles:
-            self.player_hands[self.current_player].remove(tile)
-        
-        # Update table with new configuration - CRITICAL: deep copy to avoid shared references
+        for t in action.tiles:
+            self.player_hands[self.current_player].remove(t)
         self.table = copy.deepcopy(action.table_config)
-        
-        # Validate no duplicate tiles on table
         self._validate_table_integrity()
     
     def _validate_table_integrity(self):
-        """Ensure no tile appears multiple times on the table (would indicate a bug)"""
-        all_table_tile_ids = []
-        for tile_set in self.table:
-            for tile in tile_set.tiles:
-                all_table_tile_ids.append(tile.tile_id)
-        
-        if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
-            # Find duplicates for debugging
+        all_ids = [t.tile_id for ts in self.table for t in ts.tiles]
+        if len(all_ids) != len(set(all_ids)):
             from collections import Counter
-            counts = Counter(all_table_tile_ids)
-            duplicates = {tid: cnt for tid, cnt in counts.items() if cnt > 1}
-            print(f"CRITICAL ERROR: Duplicate tiles detected on table after action: {duplicates}")
-            print(f"Table state: {[[str(t) + f'({t.tile_id})' for t in ts.tiles] for ts in self.table]}")
-            raise ValueError(f"Table corruption detected: duplicate tile_ids {duplicates}")
+            dups = {k: v for k, v in Counter(all_ids).items() if v > 1}
+            raise ValueError(f"Table corruption: {dups}")
     
     def render(self):
-        """Print the current game state"""
         print(f"\n{'='*60}")
         print(f"Turn {self.turn_count} - Player {self.current_player}'s turn")
         print(f"{'='*60}")
-        
         for i, hand in enumerate(self.player_hands):
-            value = self._calculate_hand_value(i)
-            print(f"\nPlayer {i} hand ({len(hand)} tiles, value={value}): ", end="")
+            val = self._calculate_hand_value(i)
             if i == self.current_player:
-                print([str(t) for t in hand])
+                print(f"Player {i} ({len(hand)} tiles, val={val}): {[str(t) for t in hand]}")
             else:
-                print(f"[{len(hand)} hidden tiles]")
-        
-        print(f"\nTable ({len(self.table)} sets):")
-        for i, tile_set in enumerate(self.table):
-            print(f"  Set {i+1} ({tile_set.set_type}): {[str(t) for t in tile_set.tiles]}")
-        
-        print(f"\nPool: {len(self.tiles_deck)} tiles remaining")
-        print(f"Initial meld status: Player 0={self.has_melded[0]}, Player 1={self.has_melded[1]}")
-        
-        if self.game_over:
-            print(f"\n{'='*60}")
-            if self.winner is not None:
-                print(f"GAME OVER! Winner: Player {self.winner}")
-            else:
-                print(f"GAME OVER! Tie!")
-            print(f"{'='*60}")
+                print(f"Player {i} ({len(hand)} tiles, val={val}): [hidden]")
+        print(f"Table: {len(self.table)} sets")
+        print(f"Pool: {len(self.tiles_deck)} | Melded: {self.has_melded}")
 
 
-# Example usage
 if __name__ == "__main__":
+    # Quick test
     env = RummikubEnv(seed=42)
-    state = env.reset()
-    
-    print("Initial state:")
-    env.render()
-    
-    # Example turn: draw a tile
-    legal_actions = env.get_legal_actions(env.current_player)
-    if legal_actions:
-        action = legal_actions[0]  # Just draw for this example
-        state, reward, done, info = env.step(action)
-        print(f"\nAction taken: {action.action_type}")
-        print(f"Reward: {reward}")
-        print(f"Done: {done}")
-        print(f"Info: {info}")
-        env.render()
+    print("Reward configuration:")
+    print(f"  LOSE_EMPTY_HAND = {env.REWARD_LOSE_EMPTY_HAND}")
+    print(f"  When opponent wins with agent having 150 in hand:")
+    print(f"  Agent reward = {env.REWARD_LOSE_EMPTY_HAND} - 150 = {env.REWARD_LOSE_EMPTY_HAND - 150}")
+    print(f"  This is ALWAYS < {env.REWARD_LOSE_EMPTY_HAND}")

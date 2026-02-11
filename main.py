@@ -2,38 +2,19 @@
 """
 Main Training Script for Rummikub RL Agent with A3C
 
-Reward function (using Config from agent.py):
+REWARDS ARE COMPUTED IN Rummikub_env.py - NOT HERE!
 
-Intermediate rewards (after each agent turn):
-  1. Base: 3 * (hand_value_before - hand_value_after)
-  2. Ice-breaking bonus: +30 (one-time, when agent first melds 30+ points)
-  3. Tile efficiency: +2 per tile played
-  4. Table manipulation: +5 if rearrangement occurred
-  5. Drawing penalty: -5
+The environment's step() function returns:
+    info['reward_for_player_0'] - reward from player 0's perspective
+    info['reward_for_player_1'] - reward from player 1's perspective
 
-Terminal rewards (at game end):
-  6. Win by empty hand: +300 + opponent_hand_value + base_reward_for_winning_turn
-  7. Win by lowest hand (pool empty): +50
-  8. Lose when opponent empties hand: -(200 + my_hand_value)
-  9. Lose by lowest hand: -75
-
-Reward timing:
-  - Agent's turn -> Agent receives R_t immediately after action
-  - Opponent's turn -> No reward for agent (just observe)
-  - Terminal: Add terminal bonus/penalty to final reward
+This script simply uses info['reward_for_player_{agent_player}']
 
 Running:
-    Resume training from checkpoint: 
-        python main.py --checkpoint checkpoint_13.pth 
-
-    Resume training from checkpoint with custom settings:
-        python main.py --checkpoint checkpoint_13.pth --workers 3 --episodes 1000
-
-    Evaluate a checkpoint only (no training):
-        python main.py --checkpoint trained_agent_final.pth --eval-only 
-
-    Start fresh training (default):
-        python main.py
+    python main.py
+    python main.py --checkpoint checkpoint_13.pth
+    python main.py --checkpoint checkpoint_24.pth --workers 3 --episodes 1000
+    python main.py --checkpoint trained_agent_final.pth --eval-only
 """
 
 import numpy as np
@@ -42,22 +23,62 @@ import multiprocessing as mp
 from typing import List
 import sys
 import io
+from datetime import datetime
+import traceback
+import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from Rummikub_env import RummikubEnv, RummikubAction
 from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
 from Baseline_Opponent2 import RummikubILPSolver
-from agent import ACAgent, ActorCritic, Config, get_state_vec, get_action_vec
+from agent import ACAgent, ActorCritic, get_state_vec, get_action_vec
 
 import torch
 import torch.optim as optim
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for saving plots
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
-class TrainingStats:
-    """Track training statistics across workers."""
+class Config:
+    """Training configuration. Reward params are in RummikubEnv class."""
     
+    # Network architecture
+    HIDDEN_SIZE = 512
+    NUM_LSTM_LAYERS = 2
+    DROPOUT = 0.1
+    USE_LAYER_NORM = True
+    
+    # Training parameters
+    LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 1e-5
+    EXPLORATION_PROB = 0.05
+    GAMMA = 0.99
+    ENTROPY_COEF = 0.02
+    VALUE_COEF = 0.5
+    BATCH_SIZE = 64
+    GRAD_CLIP = 0.5
+    
+    # Timeout parameters
+    MAX_TURNS = 150
+    ACTION_GEN_TIMEOUT = 10.0      # Max time for get_legal_actions() call
+    OPPONENT_SOLVE_TIMEOUT = 10.0  # Max time for opponent.solve() call
+    MAX_EPISODE_TIME = 180.0       # 3 minutes max per episode (reduced from 5)
+    
+    # Action generator settings
+    ACTION_GEN_MODE = SolverMode.HYBRID
+    MAX_ILP_CALLS = 20             # Reduced from 30
+    MAX_WINDOW_SIZE = 2
+    
+    # Checkpoint settings
+    CHECKPOINT_INTERVAL = 10       # Save every 10 episodes total
+
+
+def get_timestamp():
+    return datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+
+
+class TrainingStats:
     def __init__(self, manager):
         self.lock = manager.Lock()
         self.episodes = manager.Value('i', 0)
@@ -67,26 +88,26 @@ class TrainingStats:
         self.total_reward = manager.Value('d', 0.0)
         self.episode_rewards = manager.list()
         self.episode_lengths = manager.list()
+        self.timeouts = manager.Value('i', 0)
     
-    def record_episode(self, winner, agent_player, reward, length):
+    def record_episode(self, winner, agent_player, reward, length, timed_out=False):
         with self.lock:
             self.episodes.value += 1
             self.total_reward.value += reward
             self.episode_rewards.append(reward)
             self.episode_lengths.append(length)
-            
+            if timed_out:
+                self.timeouts.value += 1
             if winner == agent_player:
                 self.agent_wins.value += 1
-            elif winner is not None and winner == 1 - agent_player:
+            elif winner is not None:
                 self.opponent_wins.value += 1
             else:
                 self.ties.value += 1
     
     def get_win_rate(self):
         with self.lock:
-            eps = self.episodes.value
-            wins = self.agent_wins.value
-        return wins / eps if eps > 0 else 0.0
+            return self.agent_wins.value / max(1, self.episodes.value)
     
     def get_rewards_list(self):
         with self.lock:
@@ -100,9 +121,9 @@ class TrainingStats:
             ties = self.ties.value
             total_r = self.total_reward.value
             lengths = list(self.episode_lengths)
+            timeouts = self.timeouts.value
         
         if eps == 0:
-            print("No episodes completed yet.")
             return
         
         print(f"\n{'='*60}")
@@ -110,503 +131,378 @@ class TrainingStats:
         print(f"{'='*60}")
         print(f"Agent wins: {wins} ({wins/eps:.1%})")
         print(f"Opponent wins: {opp_wins} ({opp_wins/eps:.1%})")
-        print(f"Ties: {ties}")
+        print(f"Ties: {ties}, Timeouts: {timeouts}")
         print(f"Avg reward: {total_r / eps:.2f}")
         if lengths:
             print(f"Avg episode length: {np.mean(lengths):.1f} turns")
 
 
 class SuppressOutput:
-    """Context manager to suppress stdout/stderr."""
     def __enter__(self):
-        self._stdout = sys.stdout
-        self._stderr = sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
+        self._stdout, self._stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = io.StringIO()
         return self
     
     def __exit__(self, *args):
-        sys.stdout = self._stdout
-        sys.stderr = self._stderr
+        sys.stdout, sys.stderr = self._stdout, self._stderr
 
 
-def compute_intermediate_reward(action, info, hand_value_before, hand_value_after):
-    """
-    Compute the intermediate reward for agent's turn.
-    
-    Returns:
-        reward: float - the immediate reward after agent's action
-    """
-    reward = 0.0
-    
-    # Base reward: 3 * (hand_before - hand_after)
-    base_reward = Config.REWARD_BASE_MULTIPLIER * (hand_value_before - hand_value_after)
-    reward += base_reward
-    
-    if action.action_type == 'draw':
-        # Drawing penalty
-        reward += Config.REWARD_DRAW_PENALTY
-    else:
-        # Tile efficiency: +2 per tile played
-        tiles_played = info.get('tiles_played', 0)
-        reward += Config.REWARD_TILE_EFFICIENCY * tiles_played
-        
-        # Ice break bonus
-        if info.get('ice_broken', False):
-            reward += Config.REWARD_ICE_BREAK
-        
-        # Table manipulation bonus
-        if info.get('manipulation_occurred', False):
-            reward += Config.REWARD_TABLE_MANIPULATION
-    
-    return reward
+def run_with_timeout(func, timeout, default=None):
+    """Run a function with timeout. Returns default if timeout occurs."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            return default
+        except Exception:
+            return default
 
 
-def compute_terminal_reward(env, agent_player, info, hand_value_before):
-    """
-    Compute the terminal reward when game ends.
-    
-    When agent wins by emptying hand:
-        R_T = base_reward_for_winning_turn + 300 + opponent_hand_value
-    
-    When agent loses (opponent empties hand):
-        R_T = -(200 + agent's_remaining_hand_value)
-    
-    Args:
-        env: RummikubEnv - the environment
-        agent_player: int - which player is the agent (0 or 1)
-        info: dict - info from env.step()
-        hand_value_before: float - agent's hand value before the final action
-    
-    Returns:
-        reward: float - the terminal reward
-    """
-    winner = info.get('winner')
-    win_type = info.get('win_type', '')
-    
-    if winner == agent_player:
-        # Agent wins
-        if win_type == 'emptied_hand':
-            # Win by empty hand: base_reward + 300 + opponent's hand value
-            # base_reward = 3 * (hand_before - 0) = 3 * hand_before
-            opp_hand_value = info.get('final_opponent_hand_value', 0)
-            base_reward = Config.REWARD_BASE_MULTIPLIER * hand_value_before
-            return base_reward + Config.REWARD_WIN_EMPTY_HAND + opp_hand_value
-        elif win_type == 'lowest_hand':
-            # Win by lowest hand (pool empty)
-            return Config.REWARD_WIN_LOWEST_HAND
-        else:
-            return Config.REWARD_WIN_LOWEST_HAND  # Default win
-    elif winner is not None:
-        # Agent loses (winner is opponent)
-        if win_type == 'emptied_hand':
-            # Lose when opponent empties hand: -(200 + agent's remaining hand value)
-            my_hand_value = info.get('final_my_hand_value', 0)
-            return Config.REWARD_LOSE_EMPTY_HAND - my_hand_value
-        elif win_type == 'lowest_hand':
-            # Lose by lowest hand
-            return Config.REWARD_LOSE_LOWEST_HAND
-        else:
-            return Config.REWARD_LOSE_LOWEST_HAND  # Default loss
-    else:
-        # Tie
-        return 0.0
-
-
-def worker_process(worker_id, global_model, optimizer, num_episodes, config, stats):
+def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict, stats):
     """Worker process for A3C training."""
     
     prefix = f"[W{worker_id}]"
     
-    # Create agent
     agent = ACAgent(global_model=global_model, optimizer=optimizer, is_worker=True, use_gpu=True)
     
-    print(f"{prefix} Starting on {agent.device}...")
+    print(f"{prefix} Starting on {agent.device}... [{get_timestamp()}]")
     
-    # Create environment with Config timeout
     with SuppressOutput():
         env = RummikubEnv()
         env.action_generator = ActionGenerator(
-            mode=config['action_gen_mode'], 
-            max_ilp_calls=50, 
-            max_window_size=3, 
-            timeout_seconds=Config.TIMEOUT_SECONDS  # Use Config
+            mode=Config.ACTION_GEN_MODE, 
+            max_ilp_calls=Config.MAX_ILP_CALLS, 
+            max_window_size=Config.MAX_WINDOW_SIZE, 
+            timeout_seconds=Config.ACTION_GEN_TIMEOUT
         )
     
-    # Create opponent
     opponent = RummikubILPSolver()
     
-    print(f"{prefix} Initialized. Starting training...")
+    print(f"{prefix} Initialized. [{get_timestamp()}]")
     
-    episode_times = []  # Track episode durations
+    episode_times = []
     
     for episode in range(num_episodes):
-        episode_start_time = time.time()
+        episode_start = time.time()
+        timed_out = False
         
-        # Sync and reset
-        agent.sync_local_to_global()
-        agent.reset_hidden()
-        
-        # Reset environment
-        with SuppressOutput():
-            state = env.reset()
-        
-        done = False
-        episode_reward = 0.0  # Accumulate ONLY agent's rewards
-        turn_count = 0
-        agent_player = np.random.randint(2)
-        
-        # Track actions
-        agent_draws = 0
-        agent_plays = 0
-        opp_draws = 0
-        opp_plays = 0
-        ice_broken_turn = -1
-        
-        # Track hand value for terminal reward calculation
-        agent_hand_value_before_turn = sum(t.get_value() for t in env.player_hands[agent_player])
-        
-        agent.observe(state)
-        
-        while not done and turn_count < Config.MAX_TURNS:
-            # Check episode time limit
-            if time.time() - episode_start_time > Config.MAX_EPISODE_TIME:
-                print(f"{prefix} WARNING: Episode {episode+1} hit time limit ({Config.MAX_EPISODE_TIME}s), forcing end")
-                episode_reward = -100
-                break
+        try:
+            agent.sync_local_to_global()
+            agent.reset_hidden()
             
-            turn_count += 1
-            current_player = env.current_player
+            with SuppressOutput():
+                state = env.reset()
             
-            if current_player == agent_player:
-                # === AGENT'S TURN ===
-                state_vec = get_state_vec(state)
+            done = False
+            episode_reward = 0.0
+            turn_count = 0
+            agent_player = np.random.randint(2)
+            
+            agent_draws = agent_plays = opp_draws = opp_plays = 0
+            ice_broken_turn = -1
+            terminal_reward = 0.0
+            
+            agent.observe(state)
+            
+            while not done and turn_count < Config.MAX_TURNS:
+                # Check episode timeout at start of each turn
+                elapsed = time.time() - episode_start
+                if elapsed > Config.MAX_EPISODE_TIME:
+                    print(f"{prefix} Ep {episode+1} TIMEOUT after {elapsed:.1f}s at turn {turn_count} [{get_timestamp()}]")
+                    timed_out = True
+                    break
                 
-                # Track hand value before action
-                hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
-                agent_hand_value_before_turn = hand_value_before  # Save for potential terminal
+                turn_count += 1
+                current_player = env.current_player
                 
-                with SuppressOutput():
-                    legal_actions = env.get_legal_actions(agent_player)
-                
-                if not legal_actions:
-                    action = RummikubAction(action_type='draw')
-                    action_idx = -1
-                    action_vec = get_action_vec(action)
-                    num_actions = 0
-                    agent_draws += 1
-                else:
-                    action, action_idx, action_vecs_list = agent.select_action(state, legal_actions)
-                    action_vec = action_vecs_list[action_idx] if 0 <= action_idx < len(action_vecs_list) else get_action_vec(action)
-                    num_actions = len(legal_actions)
+                if current_player == agent_player:
+                    # === AGENT'S TURN ===
+                    state_vec = get_state_vec(state)
                     
-                    if action.action_type == 'draw':
+                    # Get legal actions with timeout
+                    def get_actions():
+                        with SuppressOutput():
+                            return env.get_legal_actions(agent_player)
+                    
+                    legal_actions = run_with_timeout(get_actions, Config.ACTION_GEN_TIMEOUT, default=[])
+                    
+                    if legal_actions is None:
+                        legal_actions = []
+                    
+                    if not legal_actions:
+                        action = RummikubAction(action_type='draw')
+                        action_idx = -1
+                        action_vec = get_action_vec(action)
+                        num_actions = 0
                         agent_draws += 1
                     else:
-                        agent_plays += 1
-                
-                next_state, reward_env, done, info = env.step(action)
-                
-                # Track hand value after action
-                hand_value_after = sum(t.get_value() for t in env.player_hands[agent_player])
-                
-                if info.get('ice_broken') and ice_broken_turn < 0:
-                    ice_broken_turn = turn_count
-                
-                # Compute agent's reward
-                if done:
-                    # Terminal: compute terminal reward
-                    agent_reward = compute_terminal_reward(env, agent_player, info, hand_value_before)
+                        action, action_idx, action_vecs_list = agent.select_action(state, legal_actions)
+                        action_vec = action_vecs_list[action_idx] if 0 <= action_idx < len(action_vecs_list) else get_action_vec(action)
+                        num_actions = len(legal_actions)
+                        if action.action_type == 'draw':
+                            agent_draws += 1
+                        else:
+                            agent_plays += 1
+                    
+                    next_state, _, done, info = env.step(action)
+                    
+                    if info.get('ice_broken') and ice_broken_turn < 0:
+                        ice_broken_turn = turn_count
+                    
+                    # GET REWARD FROM ENVIRONMENT
+                    agent_reward = info[f'reward_for_player_{agent_player}']
+                    
+                    if done:
+                        terminal_reward = agent_reward - episode_reward  # Just the terminal part
+                    
+                    next_state_vec = get_state_vec(next_state) if not done else None
+                    agent.learn(state_vec, action_idx, action_vec, agent_reward, next_state_vec, done, info, num_actions)
+                    episode_reward += agent_reward
+                    state = next_state
+                    
                 else:
-                    # Intermediate: compute step reward
-                    agent_reward = compute_intermediate_reward(action, info, hand_value_before, hand_value_after)
-                
-                next_state_vec = get_state_vec(next_state) if not done else None
-                
-                # Learn with agent's reward immediately after agent's turn
-                agent.learn(state_vec, action_idx, action_vec, agent_reward, next_state_vec, done, info, num_actions)
-                
-                # Accumulate agent's reward
-                episode_reward += agent_reward
-                state = next_state
-                
-            else:
-                # === OPPONENT'S TURN ===
-                state_vec = get_state_vec(state)
-                
-                action = opponent.solve(
-                    env.player_hands[current_player],
-                    env.table,
-                    env.has_melded[current_player]
-                )
-                
-                if action is None:
-                    action = RummikubAction(action_type='draw')
-                    opp_draws += 1
-                else:
-                    if action.action_type == 'draw':
+                    # === OPPONENT'S TURN ===
+                    state_vec = get_state_vec(state)
+                    
+                    # Solve with timeout
+                    def solve_opponent():
+                        return opponent.solve(
+                            env.player_hands[current_player],
+                            env.table,
+                            env.has_melded[current_player]
+                        )
+                    
+                    action = run_with_timeout(solve_opponent, Config.OPPONENT_SOLVE_TIMEOUT, default=None)
+                    
+                    if action is None:
+                        action = RummikubAction(action_type='draw')
                         opp_draws += 1
                     else:
-                        opp_plays += 1
-                
-                next_state, reward_env, done, info = env.step(action)
-                
-                if info.get('ice_broken') and ice_broken_turn < 0:
-                    ice_broken_turn = turn_count
-                
-                # If game ends on opponent's turn, compute agent's terminal reward
-                if done:
-                    agent_reward = compute_terminal_reward(env, agent_player, info, agent_hand_value_before_turn)
-                    episode_reward += agent_reward
+                        if action.action_type == 'draw':
+                            opp_draws += 1
+                        else:
+                            opp_plays += 1
                     
-                    # Learn the terminal transition
-                    next_state_vec = None
-                    agent.learn(state_vec, -1, None, agent_reward, next_state_vec, done, info, 0)
-                else:
-                    # Opponent's intermediate turns: just observe, no reward for agent
-                    agent.learn(state_vec, -1, None, 0, get_state_vec(next_state), done, info, 0)
-                    agent.observe(next_state)
-                
-                state = next_state
+                    next_state, _, done, info = env.step(action)
+                    
+                    if info.get('ice_broken') and ice_broken_turn < 0:
+                        ice_broken_turn = turn_count
+                    
+                    # GET REWARD FROM ENVIRONMENT
+                    agent_reward = info[f'reward_for_player_{agent_player}']
+                    
+                    if done:
+                        terminal_reward = agent_reward
+                        episode_reward += agent_reward
+                        agent.learn(state_vec, -1, None, agent_reward, None, done, info, 0)
+                    else:
+                        # No reward during opponent's non-terminal turn
+                        agent.learn(state_vec, -1, None, 0, get_state_vec(next_state), done, info, 0)
+                        agent.observe(next_state)
+                    
+                    state = next_state
+            
+            if turn_count >= Config.MAX_TURNS:
+                timed_out = True
+            
+            if timed_out and not done:
+                episode_reward -= 100
+                terminal_reward = -100
+            
+        except Exception as e:
+            print(f"{prefix} Ep {episode+1} ERROR: {e} [{get_timestamp()}]")
+            traceback.print_exc()
+            episode_reward = -200
+            timed_out = True
+            terminal_reward = -200
         
-        # Handle infinite loop case
-        if turn_count >= Config.MAX_TURNS:
-            print(f"{prefix} WARNING: Episode {episode+1} hit max turns ({Config.MAX_TURNS}), forcing end")
-            episode_reward = -100
-        
-        # Record stats
-        episode_time = time.time() - episode_start_time
+        episode_time = time.time() - episode_start
         episode_times.append(episode_time)
-        stats.record_episode(env.winner, agent_player, episode_reward, turn_count)
         
-        # Determine winner string
-        if env.winner == agent_player:
+        winner = env.winner
+        stats.record_episode(winner, agent_player, episode_reward, turn_count, timed_out)
+        
+        if winner == agent_player:
             winner_str = "AGENT WIN"
-        elif env.winner is not None:
+        elif winner is not None:
             winner_str = "OPP WIN"
         else:
-            winner_str = "TIE"
+            winner_str = "TIE/TO"
         
-        # Print episode summary with timing
         ice_str = f"T{ice_broken_turn:3d}" if ice_broken_turn > 0 else "  -"
-        print(f"{prefix} Ep {episode+1:3d}/{num_episodes} | {winner_str:9s} | "
-              f"Reward:{episode_reward:7.1f} | Turns:{turn_count:3d} | "
-              f"Agent(Draws:{agent_draws:2d} Play:{agent_plays:2d}) Opp(Draw:{opp_draws:2d} Play:{opp_plays:2d}) | "
-              f"Ice:{ice_str} | {episode_time:.1f}s")
+        timeout_str = " [TO]" if timed_out else ""
         
-        # Detailed stats every 25 episodes
+        print(f"{prefix} Ep {episode+1:3d}/{num_episodes} | {winner_str:9s} | "
+              f"R:{episode_reward:7.1f} (term:{terminal_reward:7.1f}) | "
+              f"T:{turn_count:3d} | A(D:{agent_draws:2d} P:{agent_plays:2d}) O(D:{opp_draws:2d} P:{opp_plays:2d}) | "
+              f"Ice:{ice_str} | {episode_time:.1f}s{timeout_str} | [{get_timestamp()}]")
+        
         if (episode + 1) % 25 == 0:
             win_rate = stats.get_win_rate()
             avg_time = np.mean(episode_times[-25:]) if len(episode_times) >= 25 else np.mean(episode_times)
-            print(f"{prefix} === Global: {stats.episodes.value} eps, {win_rate:.1%} win rate, avg {avg_time:.1f}s/ep ===")
+            print(f"{prefix} === Win: {win_rate:.1%}, TO: {stats.timeouts.value}, Avg: {avg_time:.1f}s/ep === [{get_timestamp()}]")
 
 
 def save_reward_plot(rewards, filename='training_rewards.png'):
-    """Save a plot of episode rewards."""
     if len(rewards) < 2:
         return
     
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(14, 6))
     
-    # Plot raw rewards
-    plt.subplot(1, 2, 1)
-    plt.plot(rewards, alpha=0.3, label='Episode Reward')
-    
-    # Moving average
-    window = min(50, len(rewards) // 4) if len(rewards) > 10 else len(rewards)
+    plt.subplot(1, 3, 1)
+    plt.plot(rewards, alpha=0.3)
+    window = min(50, len(rewards) // 4) if len(rewards) > 10 else max(1, len(rewards))
     if window > 1:
-        moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
-        plt.plot(range(window-1, len(rewards)), moving_avg, 'r-', linewidth=2, label=f'{window}-ep Moving Avg')
-    
+        ma = np.convolve(rewards, np.ones(window)/window, mode='valid')
+        plt.plot(range(window-1, len(rewards)), ma, 'r-', lw=2)
     plt.xlabel('Episode')
     plt.ylabel('Reward')
-    plt.title('Training Rewards')
-    plt.legend()
+    plt.title('Rewards')
+    plt.axhline(0, color='k', ls='--', alpha=0.5)
     plt.grid(True, alpha=0.3)
     
-    # Plot reward distribution
-    plt.subplot(1, 2, 2)
-    plt.hist(rewards, bins=50, edgecolor='black', alpha=0.7)
+    plt.subplot(1, 3, 2)
+    plt.hist(rewards, bins=50, edgecolor='k', alpha=0.7)
+    plt.axvline(0, color='r', ls='--')
+    plt.axvline(np.mean(rewards), color='g', ls='--')
     plt.xlabel('Reward')
-    plt.ylabel('Frequency')
-    plt.title('Reward Distribution')
-    plt.axvline(x=0, color='r', linestyle='--', label='Zero')
-    plt.axvline(x=np.mean(rewards), color='g', linestyle='--', label=f'Mean: {np.mean(rewards):.1f}')
-    plt.legend()
+    plt.title(f'Distribution (mean={np.mean(rewards):.1f})')
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 3, 3)
+    pos = [1 if r > 0 else 0 for r in rewards]
+    if len(pos) > 10:
+        w = min(50, len(pos) // 4)
+        rate = np.convolve(pos, np.ones(w)/w, mode='valid')
+        plt.plot(range(w-1, len(pos)), rate, 'b-', lw=2)
+    plt.xlabel('Episode')
+    plt.ylabel('Positive Rate')
+    plt.title('Pos Rate (should = Win Rate)')
+    plt.ylim(0, 1)
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
     plt.close()
-    print(f"Saved reward plot to {filename}")
 
 
-def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoint_path=None):
-    """
-    Main A3C training function.
-    
-    Args:
-        num_workers: Number of parallel worker processes
-        num_episodes_per_worker: Episodes each worker will run
-        config: Configuration dict (action_gen_mode, etc.)
-        checkpoint_path: Path to checkpoint.pth to resume training from (optional)
-    """
-    
-    if config is None:
-        config = {
-            'action_gen_mode': SolverMode.HYBRID,
-        }
-    
+def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     manager = mp.Manager()
     stats = TrainingStats(manager)
     
-    # Create global model (CPU for shared memory)
-    global_model = ActorCritic()
+    global_model = ActorCritic(
+        hidden_size=Config.HIDDEN_SIZE,
+        num_layers=Config.NUM_LSTM_LAYERS,
+        dropout=Config.DROPOUT,
+        use_layer_norm=Config.USE_LAYER_NORM
+    )
     
-    # Load checkpoint if provided
-    if checkpoint_path is not None:
-        print(f"\n{'='*60}")
-        print(f"LOADING CHECKPOINT: {checkpoint_path}")
-        print(f"{'='*60}")
-        global_model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
-        print(f"Successfully loaded weights from {checkpoint_path}")
+    if checkpoint_path:
+        try:
+            global_model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
+            print(f"Loaded: {checkpoint_path}")
+        except Exception as e:
+            print(f"Could not load checkpoint: {e}")
     
     global_model.share_memory()
     
-    # Use Config learning rate and weight decay
-    optimizer = optim.Adam(
-        global_model.parameters(), 
-        lr=Config.LEARNING_RATE,
-        weight_decay=Config.WEIGHT_DECAY
-    )
+    optimizer = optim.Adam(global_model.parameters(), lr=Config.LEARNING_RATE, weight_decay=Config.WEIGHT_DECAY)
     
     print(f"\n{'='*60}")
-    print("A3C TRAINING - RUMMIKUB")
+    print(f"A3C TRAINING [{get_timestamp()}]")
     print(f"{'='*60}")
-    print(f"Workers: {num_workers}")
-    print(f"Episodes per worker: {num_episodes_per_worker}")
+    print(f"Workers: {num_workers}, Episodes/worker: {num_episodes_per_worker}")
     print(f"Total episodes: {num_workers * num_episodes_per_worker}")
-    if checkpoint_path:
-        print(f"Resuming from: {checkpoint_path}")
-    
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"GPU: {gpu_name}")
-    else:
-        print(f"GPU: Not available (using CPU)")
-    
-    print(f"\n{'='*60}")
-    print("CONFIGURATION (from Config class):")
-    print(f"{'='*60}")
-    print(f"Network: hidden_size={Config.HIDDEN_SIZE}, lstm_layers={Config.NUM_LSTM_LAYERS}, dropout={Config.DROPOUT}, layer_norm={Config.LAYER_NORM}")
-    print(f"Learning: lr={Config.LEARNING_RATE}, weight_decay={Config.WEIGHT_DECAY}, exploration_prob={Config.EXPLORATION_PROB}")
-    print(f"Limits: max_turns={Config.MAX_TURNS}, timeout={Config.TIMEOUT_SECONDS}s, max_episode_time={Config.MAX_EPISODE_TIME}s")
-    
-    print(f"\n{'='*60}")
-    print("Reward Function:")
-    print(f"{'='*60}")
-    print("  Intermediate rewards (after each agent turn):")
-    print(f"    - Base: {Config.REWARD_BASE_MULTIPLIER} * (hand_before - hand_after)")
-    print(f"    - Draw penalty: {Config.REWARD_DRAW_PENALTY}")
-    print(f"    - Ice break (one-time): +{Config.REWARD_ICE_BREAK} bonus")
-    print(f"    - Tile efficiency: +{Config.REWARD_TILE_EFFICIENCY} per tile played")
-    print(f"    - Table manipulation: +{Config.REWARD_TABLE_MANIPULATION} bonus")
-    print("  Terminal rewards (at game end):")
-    print(f"    - Win (empty hand): +{Config.REWARD_WIN_EMPTY_HAND} + opponent_hand_value + base_reward")
-    print(f"    - Win (lowest hand): +{Config.REWARD_WIN_LOWEST_HAND}")
-    print(f"    - Lose (opp empty): {Config.REWARD_LOSE_EMPTY_HAND} - my_hand_value")
-    print(f"    - Lose (lowest hand): {Config.REWARD_LOSE_LOWEST_HAND}")
+    print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"\nTimeouts:")
+    print(f"  Action gen: {Config.ACTION_GEN_TIMEOUT}s")
+    print(f"  Opponent solve: {Config.OPPONENT_SOLVE_TIMEOUT}s")
+    print(f"  Max episode: {Config.MAX_EPISODE_TIME}s ({Config.MAX_EPISODE_TIME/60:.1f} min)")
+    print(f"\nReward config (from RummikubEnv):")
+    print(f"  LOSE_EMPTY_HAND = {RummikubEnv.REWARD_LOSE_EMPTY_HAND}")
+    print(f"  When opp wins: Agent gets {RummikubEnv.REWARD_LOSE_EMPTY_HAND} - agent_hand (ALWAYS < -200)")
+    print(f"\nCheckpoint: Every {Config.CHECKPOINT_INTERVAL} episodes total")
     print(f"{'='*60}\n")
     
     start_time = time.time()
     
-    # Start workers
     processes = []
-    for worker_id in range(num_workers):
-        p = mp.Process(
-            target=worker_process, 
-            args=(worker_id, global_model, optimizer, num_episodes_per_worker, config, stats)
-        )
+    for wid in range(num_workers):
+        p = mp.Process(target=worker_process, args=(wid, global_model, optimizer, num_episodes_per_worker, {}, stats))
         p.start()
         processes.append(p)
     
-    # Monitor and save checkpoints
     total_expected = num_workers * num_episodes_per_worker
-    last_checkpoint_eps = 0
-    checkpoint_interval = 40  # Save every 40 episodes (10 per worker * 4 workers)
+    last_ckpt = 0
+    ckpt_interval = Config.CHECKPOINT_INTERVAL  # Now 10 episodes
     
     while any(p.is_alive() for p in processes):
-        time.sleep(10)  # Check every 10 seconds
+        time.sleep(5)  # Check more frequently
         
         current_eps = stats.episodes.value
-        elapsed = time.time() - start_time
         
-        # Save checkpoint every ~10 episodes per worker
-        if current_eps >= last_checkpoint_eps + checkpoint_interval:
-            checkpoint_num = current_eps // checkpoint_interval
-            torch.save(global_model.state_dict(), f'checkpoint_{checkpoint_num}.pth')
+        if current_eps >= last_ckpt + ckpt_interval:
+            ckpt_num = current_eps // ckpt_interval
+            ckpt_filename = f'checkpoint_{ckpt_num}.pth'
+            torch.save(global_model.state_dict(), ckpt_filename)
             
-            # Save reward plot
             rewards = stats.get_rewards_list()
             if rewards:
-                save_reward_plot(rewards, 'training_rewards.png')
+                save_reward_plot(rewards)
+                pos = sum(1 for r in rewards if r > 0) / len(rewards)
+                neg = sum(1 for r in rewards if r < 0) / len(rewards)
+            else:
+                pos = neg = 0
             
-            last_checkpoint_eps = current_eps
+            last_ckpt = current_eps
             
-            # Print progress
-            if current_eps > 0:
-                eps_per_min = current_eps / (elapsed / 60)
-                remaining = total_expected - current_eps
-                eta_min = remaining / eps_per_min if eps_per_min > 0 else 0
-                print(f"\n[MAIN] Progress: {current_eps}/{total_expected} ({100*current_eps/total_expected:.1f}%) | "
-                      f"Win rate: {stats.get_win_rate():.1%} | "
-                      f"ETA: {eta_min:.1f} min | Saved checkpoint_{checkpoint_num}.pth")
+            elapsed = time.time() - start_time
+            eps_per_min = current_eps / (elapsed / 60) if elapsed > 0 else 0
+            eta = (total_expected - current_eps) / eps_per_min if eps_per_min > 0 else 0
+            
+            print(f"\n[MAIN] {current_eps}/{total_expected} | Win: {stats.get_win_rate():.1%} | "
+                  f"Pos/Neg: {pos:.1%}/{neg:.1%} | TO: {stats.timeouts.value} | "
+                  f"ETA: {eta:.1f}m | Saved: {ckpt_filename} [{get_timestamp()}]")
     
     for p in processes:
         p.join()
     
-    # Final save
     torch.save(global_model.state_dict(), 'trained_agent_final.pth')
     
-    # Final reward plot
     rewards = stats.get_rewards_list()
     if rewards:
         save_reward_plot(rewards, 'training_rewards_final.png')
     
-    elapsed = time.time() - start_time
     print(f"\n{'='*60}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total time: {elapsed/60:.1f} minutes")
+    print(f"COMPLETE [{get_timestamp()}] - {(time.time() - start_time)/60:.1f} min")
     stats.print_summary()
     
-    # Evaluate
     print(f"\n{'='*60}")
     print("EVALUATION")
     print(f"{'='*60}")
     agent = ACAgent()
     agent.load('trained_agent_final.pth')
-    evaluate_agent(agent, num_games=50)
+    evaluate_agent(agent, 50)
 
 
 def evaluate_agent(agent, num_games=50):
-    """Evaluate agent against opponent."""
-    
     with SuppressOutput():
         env = RummikubEnv()
         env.action_generator = ActionGenerator(
-            mode=SolverMode.HYBRID, 
-            max_ilp_calls=50, 
-            max_window_size=3, 
-            timeout_seconds=Config.TIMEOUT_SECONDS
+            mode=Config.ACTION_GEN_MODE, 
+            max_ilp_calls=Config.MAX_ILP_CALLS, 
+            max_window_size=Config.MAX_WINDOW_SIZE, 
+            timeout_seconds=Config.ACTION_GEN_TIMEOUT
         )
     
     opponent = RummikubILPSolver()
     
     wins = losses = ties = 0
     total_reward = 0
+    positive = negative = 0
     
-    print(f"Evaluating over {num_games} games...")
+    print(f"Evaluating {num_games} games... [{get_timestamp()}]")
     
     for game in range(num_games):
         with SuppressOutput():
@@ -620,39 +516,43 @@ def evaluate_agent(agent, num_games=50):
         agent.observe(state)
         
         turn = 0
-        agent_hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
+        game_start = time.time()
         
         while not done and turn < Config.MAX_TURNS:
+            # Timeout check
+            if time.time() - game_start > Config.MAX_EPISODE_TIME:
+                break
+            
             turn += 1
             if env.current_player == agent_player:
-                hand_value_before = sum(t.get_value() for t in env.player_hands[agent_player])
-                agent_hand_value_before = hand_value_before
+                def get_actions():
+                    with SuppressOutput():
+                        return env.get_legal_actions(agent_player)
                 
-                with SuppressOutput():
-                    legal_actions = env.get_legal_actions(agent_player)
-                if not legal_actions:
-                    action = RummikubAction(action_type='draw')
-                else:
-                    action, _, _ = agent.select_action(state, legal_actions)
-                state, reward, done, info = env.step(action)
+                legal = run_with_timeout(get_actions, Config.ACTION_GEN_TIMEOUT, default=[])
+                if legal is None:
+                    legal = []
                 
-                hand_value_after = sum(t.get_value() for t in env.player_hands[agent_player])
-                
-                if done:
-                    game_reward = compute_terminal_reward(env, agent_player, info, hand_value_before)
-                else:
-                    game_reward += compute_intermediate_reward(action, info, hand_value_before, hand_value_after)
+                action = agent.select_action(state, legal)[0] if legal else RummikubAction(action_type='draw')
+                state, _, done, info = env.step(action)
+                game_reward += info[f'reward_for_player_{agent_player}']
             else:
-                action = opponent.solve(env.player_hands[env.current_player], env.table, env.has_melded[env.current_player])
+                def solve_opp():
+                    return opponent.solve(env.player_hands[env.current_player], env.table, env.has_melded[env.current_player])
+                
+                action = run_with_timeout(solve_opp, Config.OPPONENT_SOLVE_TIMEOUT, default=None)
                 if action is None:
                     action = RummikubAction(action_type='draw')
-                state, reward, done, info = env.step(action)
+                state, _, done, info = env.step(action)
+                game_reward += info[f'reward_for_player_{agent_player}']
                 agent.observe(state)
-                
-                if done:
-                    game_reward += compute_terminal_reward(env, agent_player, info, agent_hand_value_before)
         
         total_reward += game_reward
+        
+        if game_reward > 0:
+            positive += 1
+        elif game_reward < 0:
+            negative += 1
         
         if env.winner == agent_player:
             wins += 1
@@ -662,43 +562,37 @@ def evaluate_agent(agent, num_games=50):
             ties += 1
         
         if (game + 1) % 10 == 0:
-            print(f"  {game+1}/{num_games} - W:{wins} L:{losses} T:{ties} | Avg R: {total_reward/(game+1):.1f}")
+            print(f"  {game+1}/{num_games} - W:{wins} L:{losses} T:{ties} | "
+                  f"Avg: {total_reward/(game+1):.1f} | +/-: {positive}/{negative}")
     
-    print(f"\nFinal: {wins}W / {losses}L / {ties}T = {100*wins/num_games:.1f}% win rate")
-    print(f"Average reward: {total_reward/num_games:.1f}")
+    print(f"\nFinal: {wins}W/{losses}L/{ties}T = {100*wins/num_games:.1f}% win")
+    print(f"Avg reward: {total_reward/num_games:.1f}")
+    print(f"Positive/Negative: {positive}/{negative}")
+    print(f"Verification: Wins should have positive, Losses should have negative")
     
-    return {'wins': wins, 'losses': losses, 'ties': ties, 'win_rate': wins/num_games}
+    return {'wins': wins, 'losses': losses, 'win_rate': wins/num_games}
 
 
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='A3C Training for Rummikub')
-    parser.add_argument('--checkpoint', '-c', type=str, default=None,
-                        help='Path to checkpoint.pth to resume training from')
-    parser.add_argument('--workers', '-w', type=int, default=4,
-                        help='Number of worker processes (default: 4)')
-    parser.add_argument('--episodes', '-e', type=int, default=500,
-                        help='Episodes per worker (default: 500)')
-    parser.add_argument('--eval-only', action='store_true',
-                        help='Only evaluate the checkpoint, no training')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', '-c', type=str, default=None)
+    parser.add_argument('--workers', '-w', type=int, default=4)
+    parser.add_argument('--episodes', '-e', type=int, default=500)
+    parser.add_argument('--eval-only', action='store_true')
     
     args = parser.parse_args()
     
     if args.eval_only:
-        if args.checkpoint is None:
-            print("Error: --eval-only requires --checkpoint")
+        if not args.checkpoint:
+            print("--eval-only requires --checkpoint")
             return
-        print(f"Evaluating checkpoint: {args.checkpoint}")
         agent = ACAgent()
         agent.load(args.checkpoint)
-        evaluate_agent(agent, num_games=100)
+        evaluate_agent(agent, 100)
     else:
-        train_a3c(
-            num_workers=args.workers,
-            num_episodes_per_worker=args.episodes,
-            checkpoint_path=args.checkpoint
-        )
+        train_a3c(args.workers, args.episodes, args.checkpoint)
 
 
 if __name__ == "__main__":
