@@ -10,10 +10,15 @@ The environment's step() function returns:
 
 This script simply uses info['reward_for_player_{agent_player}']
 
+TIMEOUTS:
+    - ActionGenerator has internal timeout (timeout_seconds parameter)
+    - RummikubILPSolver has internal timeout (time_limit_seconds parameter)
+    - MAX_EPISODE_TIME is a safety net checked at start of each turn
+
 Running:
     python main.py
     python main.py --checkpoint checkpoint_13.pth
-    python main.py --checkpoint checkpoint_24.pth --workers 3 --episodes 1000
+    python main.py --checkpoint checkpoint_13.pth --workers 3 --episodes 1000
     python main.py --checkpoint trained_agent_final.pth --eval-only
 """
 
@@ -25,8 +30,6 @@ import sys
 import io
 from datetime import datetime
 import traceback
-import signal
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from Rummikub_env import RummikubEnv, RummikubAction
 from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
@@ -50,7 +53,7 @@ class Config:
     USE_LAYER_NORM = True
     
     # Training parameters
-    LEARNING_RATE = 0.001
+    LEARNING_RATE = 0.0003  
     WEIGHT_DECAY = 1e-5
     EXPLORATION_PROB = 0.05
     GAMMA = 0.99
@@ -61,13 +64,13 @@ class Config:
     
     # Timeout parameters
     MAX_TURNS = 150
-    ACTION_GEN_TIMEOUT = 10.0      # Max time for get_legal_actions() call
-    OPPONENT_SOLVE_TIMEOUT = 10.0  # Max time for opponent.solve() call
-    MAX_EPISODE_TIME = 180.0       # 3 minutes max per episode (reduced from 5)
+    ACTION_GEN_TIMEOUT = 10.0      # Passed to ActionGenerator (internal timeout)
+    OPPONENT_TIMEOUT = 5.0         # Passed to RummikubILPSolver (internal timeout)
+    MAX_EPISODE_TIME = 180.0       # 3 minutes max per episode (safety net)
     
     # Action generator settings
     ACTION_GEN_MODE = SolverMode.HYBRID
-    MAX_ILP_CALLS = 20             # Reduced from 30
+    MAX_ILP_CALLS = 20
     MAX_WINDOW_SIZE = 2
     
     # Checkpoint settings
@@ -87,14 +90,16 @@ class TrainingStats:
         self.ties = manager.Value('i', 0)
         self.total_reward = manager.Value('d', 0.0)
         self.episode_rewards = manager.list()
+        self.terminal_rewards = manager.list()  # NEW: track terminal rewards
         self.episode_lengths = manager.list()
         self.timeouts = manager.Value('i', 0)
     
-    def record_episode(self, winner, agent_player, reward, length, timed_out=False):
+    def record_episode(self, winner, agent_player, reward, terminal_reward, length, timed_out=False):
         with self.lock:
             self.episodes.value += 1
             self.total_reward.value += reward
             self.episode_rewards.append(reward)
+            self.terminal_rewards.append(terminal_reward)  # NEW
             self.episode_lengths.append(length)
             if timed_out:
                 self.timeouts.value += 1
@@ -111,7 +116,7 @@ class TrainingStats:
     
     def get_rewards_list(self):
         with self.lock:
-            return list(self.episode_rewards)
+            return list(self.episode_rewards), list(self.terminal_rewards)
     
     def print_summary(self):
         with self.lock:
@@ -122,6 +127,7 @@ class TrainingStats:
             total_r = self.total_reward.value
             lengths = list(self.episode_lengths)
             timeouts = self.timeouts.value
+            term_rewards = list(self.terminal_rewards)
         
         if eps == 0:
             return
@@ -132,7 +138,9 @@ class TrainingStats:
         print(f"Agent wins: {wins} ({wins/eps:.1%})")
         print(f"Opponent wins: {opp_wins} ({opp_wins/eps:.1%})")
         print(f"Ties: {ties}, Timeouts: {timeouts}")
-        print(f"Avg reward: {total_r / eps:.2f}")
+        print(f"Avg total reward: {total_r / eps:.2f}")
+        if term_rewards:
+            print(f"Avg terminal reward: {np.mean(term_rewards):.2f}")
         if lengths:
             print(f"Avg episode length: {np.mean(lengths):.1f} turns")
 
@@ -147,18 +155,6 @@ class SuppressOutput:
         sys.stdout, sys.stderr = self._stdout, self._stderr
 
 
-def run_with_timeout(func, timeout, default=None):
-    """Run a function with timeout. Returns default if timeout occurs."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(func)
-        try:
-            return future.result(timeout=timeout)
-        except FuturesTimeoutError:
-            return default
-        except Exception:
-            return default
-
-
 def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict, stats):
     """Worker process for A3C training."""
     
@@ -170,6 +166,7 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
     
     with SuppressOutput():
         env = RummikubEnv()
+        # ActionGenerator handles its own timeout internally
         env.action_generator = ActionGenerator(
             mode=Config.ACTION_GEN_MODE, 
             max_ilp_calls=Config.MAX_ILP_CALLS, 
@@ -177,7 +174,8 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
             timeout_seconds=Config.ACTION_GEN_TIMEOUT
         )
     
-    opponent = RummikubILPSolver()
+    # RummikubILPSolver handles its own timeout internally
+    opponent = RummikubILPSolver(time_limit_seconds=Config.OPPONENT_TIMEOUT)
     
     print(f"{prefix} Initialized. [{get_timestamp()}]")
     
@@ -187,6 +185,14 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
         episode_start = time.time()
         timed_out = False
         
+        # Initialize variables BEFORE try block to prevent UnboundLocalError
+        agent_player = 0
+        episode_reward = 0.0
+        terminal_reward = 0.0
+        turn_count = 0
+        agent_draws = agent_plays = opp_draws = opp_plays = 0
+        ice_broken_turn = -1
+        
         try:
             agent.sync_local_to_global()
             agent.reset_hidden()
@@ -195,18 +201,12 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
                 state = env.reset()
             
             done = False
-            episode_reward = 0.0
-            turn_count = 0
-            agent_player = np.random.randint(2)
-            
-            agent_draws = agent_plays = opp_draws = opp_plays = 0
-            ice_broken_turn = -1
-            terminal_reward = 0.0
+            agent_player = np.random.randint(2)  # Randomize after init
             
             agent.observe(state)
             
             while not done and turn_count < Config.MAX_TURNS:
-                # Check episode timeout at start of each turn
+                # Safety net: check episode timeout at start of each turn
                 elapsed = time.time() - episode_start
                 if elapsed > Config.MAX_EPISODE_TIME:
                     print(f"{prefix} Ep {episode+1} TIMEOUT after {elapsed:.1f}s at turn {turn_count} [{get_timestamp()}]")
@@ -220,25 +220,23 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
                     # === AGENT'S TURN ===
                     state_vec = get_state_vec(state)
                     
-                    # Get legal actions with timeout
-                    def get_actions():
+                    # ActionGenerator has internal timeout
+                    try:
                         with SuppressOutput():
-                            return env.get_legal_actions(agent_player)
-                    
-                    legal_actions = run_with_timeout(get_actions, Config.ACTION_GEN_TIMEOUT, default=[])
-                    
-                    if legal_actions is None:
+                            legal_actions = env.get_legal_actions(agent_player)
+                    except Exception as e:
+                        print(f"{prefix} Error getting actions: {e}")
                         legal_actions = []
                     
                     if not legal_actions:
                         action = RummikubAction(action_type='draw')
                         action_idx = -1
-                        action_vec = get_action_vec(action)
+                        action_vecs_list = []  # No actions available
                         num_actions = 0
                         agent_draws += 1
                     else:
+                        # select_action returns ALL action vectors for proper learning
                         action, action_idx, action_vecs_list = agent.select_action(state, legal_actions)
-                        action_vec = action_vecs_list[action_idx] if 0 <= action_idx < len(action_vecs_list) else get_action_vec(action)
                         num_actions = len(legal_actions)
                         if action.action_type == 'draw':
                             agent_draws += 1
@@ -254,10 +252,13 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
                     agent_reward = info[f'reward_for_player_{agent_player}']
                     
                     if done:
-                        terminal_reward = agent_reward - episode_reward  # Just the terminal part
+                        # terminal_reward = the FULL reward for this terminal turn
+                        # For agent winning: intermediate + 300 + opp_hand (always > 300)
+                        terminal_reward = agent_reward
                     
                     next_state_vec = get_state_vec(next_state) if not done else None
-                    agent.learn(state_vec, action_idx, action_vec, agent_reward, next_state_vec, done, info, num_actions)
+                    # Pass ALL action vectors for proper actor loss computation
+                    agent.learn(state_vec, action_idx, action_vecs_list, agent_reward, next_state_vec, done, info, num_actions)
                     episode_reward += agent_reward
                     state = next_state
                     
@@ -265,15 +266,16 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
                     # === OPPONENT'S TURN ===
                     state_vec = get_state_vec(state)
                     
-                    # Solve with timeout
-                    def solve_opponent():
-                        return opponent.solve(
+                    # RummikubILPSolver has internal timeout
+                    try:
+                        action = opponent.solve(
                             env.player_hands[current_player],
                             env.table,
                             env.has_melded[current_player]
                         )
-                    
-                    action = run_with_timeout(solve_opponent, Config.OPPONENT_SOLVE_TIMEOUT, default=None)
+                    except Exception as e:
+                        print(f"{prefix} Opponent error: {e}")
+                        action = None
                     
                     if action is None:
                         action = RummikubAction(action_type='draw')
@@ -297,7 +299,6 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
                         episode_reward += agent_reward
                         agent.learn(state_vec, -1, None, agent_reward, None, done, info, 0)
                     else:
-                        # No reward during opponent's non-terminal turn
                         agent.learn(state_vec, -1, None, 0, get_state_vec(next_state), done, info, 0)
                         agent.observe(next_state)
                     
@@ -321,7 +322,7 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
         episode_times.append(episode_time)
         
         winner = env.winner
-        stats.record_episode(winner, agent_player, episode_reward, turn_count, timed_out)
+        stats.record_episode(winner, agent_player, episode_reward, terminal_reward, turn_count, timed_out)
         
         if winner == agent_player:
             winner_str = "AGENT WIN"
@@ -344,43 +345,80 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config_dict
             print(f"{prefix} === Win: {win_rate:.1%}, TO: {stats.timeouts.value}, Avg: {avg_time:.1f}s/ep === [{get_timestamp()}]")
 
 
-def save_reward_plot(rewards, filename='training_rewards.png'):
-    if len(rewards) < 2:
+def save_reward_plot(total_rewards, terminal_rewards, filename='training_rewards.png'):
+    """
+    Save a 2x2 training progress graph.
+    
+    Row 1: Total episode rewards (line graph + histogram)
+    Row 2: Terminal rewards (line graph + histogram)
+    """
+    if len(total_rewards) < 2:
         return
     
-    plt.figure(figsize=(14, 6))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    plt.subplot(1, 3, 1)
-    plt.plot(rewards, alpha=0.3)
-    window = min(50, len(rewards) // 4) if len(rewards) > 10 else max(1, len(rewards))
+    # Calculate moving average window
+    window = min(50, len(total_rewards) // 4) if len(total_rewards) > 10 else max(1, len(total_rewards))
+    
+    # =========================================
+    # Row 1, Column 1: Total Reward Line Graph
+    # =========================================
+    ax = axes[0, 0]
+    ax.plot(total_rewards, alpha=0.3, color='blue', label='Episode Reward')
     if window > 1:
-        ma = np.convolve(rewards, np.ones(window)/window, mode='valid')
-        plt.plot(range(window-1, len(rewards)), ma, 'r-', lw=2)
-    plt.xlabel('Episode')
-    plt.ylabel('Reward')
-    plt.title('Rewards')
-    plt.axhline(0, color='k', ls='--', alpha=0.5)
-    plt.grid(True, alpha=0.3)
+        ma = np.convolve(total_rewards, np.ones(window)/window, mode='valid')
+        ax.plot(range(window-1, len(total_rewards)), ma, 'b-', lw=2, label=f'{window}-ep Moving Avg')
+    ax.axhline(0, color='black', ls='--', alpha=0.5)
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Total Reward')
+    ax.set_title('Total Episode Rewards')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
     
-    plt.subplot(1, 3, 2)
-    plt.hist(rewards, bins=50, edgecolor='k', alpha=0.7)
-    plt.axvline(0, color='r', ls='--')
-    plt.axvline(np.mean(rewards), color='g', ls='--')
-    plt.xlabel('Reward')
-    plt.title(f'Distribution (mean={np.mean(rewards):.1f})')
-    plt.grid(True, alpha=0.3)
+    # =========================================
+    # Row 1, Column 2: Total Reward Histogram
+    # =========================================
+    ax = axes[0, 1]
+    ax.hist(total_rewards, bins=50, edgecolor='black', alpha=0.7, color='blue')
+    ax.axvline(0, color='black', ls='--', lw=2, label='Zero')
+    mean_total = np.mean(total_rewards)
+    ax.axvline(mean_total, color='red', ls='-', lw=2, label=f'Mean: {mean_total:.1f}')
+    ax.set_xlabel('Total Reward')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Total Reward Distribution')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
     
-    plt.subplot(1, 3, 3)
-    pos = [1 if r > 0 else 0 for r in rewards]
-    if len(pos) > 10:
-        w = min(50, len(pos) // 4)
-        rate = np.convolve(pos, np.ones(w)/w, mode='valid')
-        plt.plot(range(w-1, len(pos)), rate, 'b-', lw=2)
-    plt.xlabel('Episode')
-    plt.ylabel('Positive Rate')
-    plt.title('Pos Rate (should = Win Rate)')
-    plt.ylim(0, 1)
-    plt.grid(True, alpha=0.3)
+    # =========================================
+    # Row 2, Column 1: Terminal Reward Line Graph
+    # =========================================
+    ax = axes[1, 0]
+    ax.plot(terminal_rewards, alpha=0.3, color='green', label='Terminal Reward')
+    if window > 1 and len(terminal_rewards) >= window:
+        ma = np.convolve(terminal_rewards, np.ones(window)/window, mode='valid')
+        ax.plot(range(window-1, len(terminal_rewards)), ma, 'g-', lw=2, label=f'{window}-ep Moving Avg')
+    ax.axhline(0, color='black', ls='--', alpha=0.5)
+    ax.axhline(300, color='blue', ls=':', alpha=0.5, label='Win threshold (300)')
+    ax.axhline(-200, color='red', ls=':', alpha=0.5, label='Lose threshold (-200)')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Terminal Reward')
+    ax.set_title('Terminal Rewards (Win: >300, Lose: <-200)')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    # =========================================
+    # Row 2, Column 2: Terminal Reward Histogram
+    # =========================================
+    ax = axes[1, 1]
+    ax.hist(terminal_rewards, bins=50, edgecolor='black', alpha=0.7, color='green')
+    ax.axvline(0, color='black', ls='--', lw=2, label='Zero')
+    mean_term = np.mean(terminal_rewards)
+    ax.axvline(mean_term, color='red', ls='-', lw=2, label=f'Mean: {mean_term:.1f}')
+    ax.set_xlabel('Terminal Reward')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Terminal Reward Distribution')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
@@ -401,7 +439,17 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     if checkpoint_path:
         try:
             global_model.load_state_dict(torch.load(checkpoint_path, map_location='cpu', weights_only=True))
-            print(f"Loaded: {checkpoint_path}")
+            print(f"Loaded checkpoint: {checkpoint_path}")
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "Unexpected key" in str(e):
+                print(f"\n{'='*60}")
+                print("WARNING: Checkpoint architecture mismatch!")
+                print("The checkpoint was trained with a different model architecture.")
+                print("Starting with FRESH weights (checkpoint ignored).")
+                print("Delete old checkpoints before training.")
+                print(f"{'='*60}\n")
+            else:
+                print(f"Could not load checkpoint: {e}")
         except Exception as e:
             print(f"Could not load checkpoint: {e}")
     
@@ -415,10 +463,10 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     print(f"Workers: {num_workers}, Episodes/worker: {num_episodes_per_worker}")
     print(f"Total episodes: {num_workers * num_episodes_per_worker}")
     print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    print(f"\nTimeouts:")
-    print(f"  Action gen: {Config.ACTION_GEN_TIMEOUT}s")
-    print(f"  Opponent solve: {Config.OPPONENT_SOLVE_TIMEOUT}s")
-    print(f"  Max episode: {Config.MAX_EPISODE_TIME}s ({Config.MAX_EPISODE_TIME/60:.1f} min)")
+    print(f"\nTimeouts (internal to solvers):")
+    print(f"  ActionGenerator: {Config.ACTION_GEN_TIMEOUT}s")
+    print(f"  RummikubILPSolver: {Config.OPPONENT_TIMEOUT}s")
+    print(f"  Max episode (safety): {Config.MAX_EPISODE_TIME}s ({Config.MAX_EPISODE_TIME/60:.1f} min)")
     print(f"\nReward config (from RummikubEnv):")
     print(f"  LOSE_EMPTY_HAND = {RummikubEnv.REWARD_LOSE_EMPTY_HAND}")
     print(f"  When opp wins: Agent gets {RummikubEnv.REWARD_LOSE_EMPTY_HAND} - agent_hand (ALWAYS < -200)")
@@ -435,10 +483,10 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     
     total_expected = num_workers * num_episodes_per_worker
     last_ckpt = 0
-    ckpt_interval = Config.CHECKPOINT_INTERVAL  # Now 10 episodes
+    ckpt_interval = Config.CHECKPOINT_INTERVAL
     
     while any(p.is_alive() for p in processes):
-        time.sleep(5)  # Check more frequently
+        time.sleep(5)
         
         current_eps = stats.episodes.value
         
@@ -447,13 +495,14 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
             ckpt_filename = f'checkpoint_{ckpt_num}.pth'
             torch.save(global_model.state_dict(), ckpt_filename)
             
-            rewards = stats.get_rewards_list()
-            if rewards:
-                save_reward_plot(rewards)
-                pos = sum(1 for r in rewards if r > 0) / len(rewards)
-                neg = sum(1 for r in rewards if r < 0) / len(rewards)
+            total_rewards, terminal_rewards = stats.get_rewards_list()
+            if total_rewards:
+                save_reward_plot(total_rewards, terminal_rewards)
+                pos = sum(1 for r in total_rewards if r > 0) / len(total_rewards)
+                neg = sum(1 for r in total_rewards if r < 0) / len(total_rewards)
+                avg_term = np.mean(terminal_rewards) if terminal_rewards else 0
             else:
-                pos = neg = 0
+                pos = neg = avg_term = 0
             
             last_ckpt = current_eps
             
@@ -462,7 +511,7 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
             eta = (total_expected - current_eps) / eps_per_min if eps_per_min > 0 else 0
             
             print(f"\n[MAIN] {current_eps}/{total_expected} | Win: {stats.get_win_rate():.1%} | "
-                  f"Pos/Neg: {pos:.1%}/{neg:.1%} | TO: {stats.timeouts.value} | "
+                  f"Pos/Neg: {pos:.1%}/{neg:.1%} | AvgTerm: {avg_term:.1f} | TO: {stats.timeouts.value} | "
                   f"ETA: {eta:.1f}m | Saved: {ckpt_filename} [{get_timestamp()}]")
     
     for p in processes:
@@ -470,9 +519,9 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     
     torch.save(global_model.state_dict(), 'trained_agent_final.pth')
     
-    rewards = stats.get_rewards_list()
-    if rewards:
-        save_reward_plot(rewards, 'training_rewards_final.png')
+    total_rewards, terminal_rewards = stats.get_rewards_list()
+    if total_rewards:
+        save_reward_plot(total_rewards, terminal_rewards, 'training_rewards_final.png')
     
     print(f"\n{'='*60}")
     print(f"COMPLETE [{get_timestamp()}] - {(time.time() - start_time)/60:.1f} min")
@@ -481,7 +530,13 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, checkpoint_path=None):
     print(f"\n{'='*60}")
     print("EVALUATION")
     print(f"{'='*60}")
-    agent = ACAgent()
+    # Create ACAgent with matching architecture for loading checkpoint
+    agent = ACAgent(
+        hidden_size=Config.HIDDEN_SIZE,
+        num_layers=Config.NUM_LSTM_LAYERS,
+        dropout=Config.DROPOUT,
+        use_layer_norm=Config.USE_LAYER_NORM
+    )
     agent.load('trained_agent_final.pth')
     evaluate_agent(agent, 50)
 
@@ -496,7 +551,7 @@ def evaluate_agent(agent, num_games=50):
             timeout_seconds=Config.ACTION_GEN_TIMEOUT
         )
     
-    opponent = RummikubILPSolver()
+    opponent = RummikubILPSolver(time_limit_seconds=Config.OPPONENT_TIMEOUT)
     
     wins = losses = ties = 0
     total_reward = 0
@@ -519,28 +574,26 @@ def evaluate_agent(agent, num_games=50):
         game_start = time.time()
         
         while not done and turn < Config.MAX_TURNS:
-            # Timeout check
             if time.time() - game_start > Config.MAX_EPISODE_TIME:
                 break
             
             turn += 1
             if env.current_player == agent_player:
-                def get_actions():
+                try:
                     with SuppressOutput():
-                        return env.get_legal_actions(agent_player)
-                
-                legal = run_with_timeout(get_actions, Config.ACTION_GEN_TIMEOUT, default=[])
-                if legal is None:
+                        legal = env.get_legal_actions(agent_player)
+                except:
                     legal = []
                 
                 action = agent.select_action(state, legal)[0] if legal else RummikubAction(action_type='draw')
                 state, _, done, info = env.step(action)
                 game_reward += info[f'reward_for_player_{agent_player}']
             else:
-                def solve_opp():
-                    return opponent.solve(env.player_hands[env.current_player], env.table, env.has_melded[env.current_player])
+                try:
+                    action = opponent.solve(env.player_hands[env.current_player], env.table, env.has_melded[env.current_player])
+                except:
+                    action = None
                 
-                action = run_with_timeout(solve_opp, Config.OPPONENT_SOLVE_TIMEOUT, default=None)
                 if action is None:
                     action = RummikubAction(action_type='draw')
                 state, _, done, info = env.step(action)
@@ -576,11 +629,15 @@ def evaluate_agent(agent, num_games=50):
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', '-c', type=str, default=None)
-    parser.add_argument('--workers', '-w', type=int, default=4)
-    parser.add_argument('--episodes', '-e', type=int, default=500)
-    parser.add_argument('--eval-only', action='store_true')
+    parser = argparse.ArgumentParser(description='A3C Training for Rummikub')
+    parser.add_argument('--checkpoint', '-c', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--workers', '-w', type=int, default=4,
+                        help='Number of worker processes (default: 4)')
+    parser.add_argument('--episodes', '-e', type=int, default=500,
+                        help='Episodes per worker (default: 500)')
+    parser.add_argument('--eval-only', action='store_true',
+                        help='Only evaluate, no training')
     
     args = parser.parse_args()
     
@@ -588,7 +645,14 @@ def main():
         if not args.checkpoint:
             print("--eval-only requires --checkpoint")
             return
-        agent = ACAgent()
+        print(f"Evaluating: {args.checkpoint} [{get_timestamp()}]")
+        # Create ACAgent with matching architecture for loading checkpoint
+        agent = ACAgent(
+            hidden_size=Config.HIDDEN_SIZE,
+            num_layers=Config.NUM_LSTM_LAYERS,
+            dropout=Config.DROPOUT,
+            use_layer_norm=Config.USE_LAYER_NORM
+        )
         agent.load(args.checkpoint)
         evaluate_agent(agent, 100)
     else:

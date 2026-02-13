@@ -1,3 +1,14 @@
+"""
+Actor-Critic Agent for Rummikub
+
+Fixes from original:
+1. ActorCritic accepts all parameters from main.py (hidden_size, num_layers, dropout, use_layer_norm)
+2. Actor loss computed correctly using ALL legal actions
+3. Entropy regularization added
+4. Proper advantage normalization
+5. Better gradient handling
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,17 +17,22 @@ import torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional
 from collections import namedtuple
 from Rummikub_env import RummikubEnv, RummikubAction, TileType, Color
-from Rummikub_ILP_Action_Generator import ActionGenerator, SolverMode
-from Baseline_Opponent2 import RummikubILPSolver
 
+# Store numpy arrays to avoid gradient issues
 Transition = namedtuple('Transition', (
-    'state_vec', 'action_idx', 'action_vec', 'reward',
-    'next_state_vec', 'done', 'info', 'num_actions'
+    'state_vec',      # numpy array
+    'action_idx',     # int or None
+    'action_vecs',    # list of numpy arrays (ALL legal actions) or None
+    'reward',         # float
+    'next_state_vec', # numpy array or None
+    'done',           # bool
+    'info',           # dict
+    'num_actions'     # int
 ))
 
 
 def get_state_vec(state: Dict) -> np.ndarray:
-    """Convert game state to feature vector (110 dimensions)."""
+    """Convert game state to feature vector."""
     hand = state['my_hand']
     if len(hand) == 0:
         hand_counts = np.zeros(53, dtype=np.float32)
@@ -60,7 +76,7 @@ def get_state_vec(state: Dict) -> np.ndarray:
 
 
 def get_action_vec(action: RummikubAction) -> np.ndarray:
-    """Convert action to feature vector (54 dimensions)."""
+    """Convert action to feature vector."""
     tiles = action.tiles if action.tiles else []
     if len(tiles) == 0:
         played_counts = np.zeros(53, dtype=np.float32)
@@ -81,80 +97,68 @@ def get_action_vec(action: RummikubAction) -> np.ndarray:
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic network with configurable LSTM."""
+    """Actor-Critic network with LSTM.
+    
+    Defaults match main.py Config:
+    - hidden_size=512
+    - num_layers=2
+    - dropout=0.1
+    - use_layer_norm=True
+    """
     
     def __init__(self, hidden_size=512, num_layers=2, dropout=0.1, use_layer_norm=True):
         super(ActorCritic, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.use_layer_norm = use_layer_norm
         
-        # Input projection
-        self.input_proj = nn.Linear(110, hidden_size)
-        
-        # LSTM for temporal modeling
+        # Input: 110 features (53 hand + 53 table + 4 scalars)
         self.lstm = nn.LSTM(
-            hidden_size, hidden_size, 
+            input_size=110, 
+            hidden_size=hidden_size, 
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0
         )
         
-        # Layer normalization
-        if use_layer_norm:
-            self.layer_norm = nn.LayerNorm(hidden_size)
-        else:
-            self.layer_norm = None
+        # Layer norm is ALWAYS created (not None) so checkpoint loading works
+        # When use_layer_norm=False, we just don't apply it
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self._use_layer_norm = use_layer_norm
         
-        self.dropout = nn.Dropout(dropout)
-        
-        # Actor head: scores each action
+        # Actor: state + action -> score
         self.actor_head = nn.Sequential(
             nn.Linear(hidden_size + 54, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, 1)
         )
         
-        # Critic head: estimates state value
+        # Critic: state -> value
         self.critic_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, 1)
         )
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights properly."""
-        for name, param in self.lstm.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'weight_hh' in name:
-                nn.init.orthogonal_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-        
-        for module in [self.input_proj, self.actor_head, self.critic_head]:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Sequential):
-                for layer in module:
-                    if isinstance(layer, nn.Linear):
-                        nn.init.xavier_uniform_(layer.weight)
-                        if layer.bias is not None:
-                            nn.init.zeros_(layer.bias)
 
     def forward(self, state_vecs, action_vecs_list=None, hiddens=None):
+        """
+        Forward pass.
+        
+        Args:
+            state_vecs: (batch, seq_len, 110) tensor
+            action_vecs_list: List of lists of action tensors, one per batch item
+            hiddens: LSTM hidden states
+            
+        Returns:
+            values: (batch,) tensor
+            logits_list: List of logit tensors (or None if action_vecs_list is None)
+            new_hiddens: Updated LSTM hidden states
+        """
         batch_size = state_vecs.size(0)
         
         if hiddens is None:
@@ -163,27 +167,17 @@ class ActorCritic(nn.Module):
                 torch.zeros(self.num_layers, batch_size, self.hidden_size, device=state_vecs.device)
             )
         
-        # Project input
-        x = self.input_proj(state_vecs)
-        x = F.relu(x)
+        out, new_hiddens = self.lstm(state_vecs, hiddens)
+        out = out[:, -1, :]  # Take last time step
         
-        # LSTM
-        out, new_hiddens = self.lstm(x, hiddens)
-        out = out[:, -1, :]  # Take last output
-        
-        # Layer norm
-        if self.layer_norm is not None:
+        if self._use_layer_norm:
             out = self.layer_norm(out)
         
-        out = self.dropout(out)
-        
-        # Critic value
         values = self.critic_head(out).squeeze(-1)
         
         if action_vecs_list is None:
             return values, new_hiddens
         
-        # Actor logits for each action
         logits_list = []
         for b in range(batch_size):
             if action_vecs_list[b] is None or len(action_vecs_list[b]) == 0:
@@ -206,23 +200,34 @@ class ActorCritic(nn.Module):
 
 
 class ACAgent:
-    """A3C Agent with exploration and improved learning."""
-    
-    # Hyperparameters (can be overridden by Config)
-    EXPLORATION_PROB = 0.05
-    GAMMA = 0.99
-    ENTROPY_COEF = 0.02
-    VALUE_COEF = 0.5
-    BATCH_SIZE = 64
-    GRAD_CLIP = 0.5
+    """A3C Agent with proper learning."""
     
     def __init__(self, global_model=None, optimizer=None, is_worker=False, use_gpu=True,
                  hidden_size=512, num_layers=2, dropout=0.1, use_layer_norm=True):
+        """
+        Args:
+            global_model: Shared global model (CPU)
+            optimizer: Shared optimizer
+            is_worker: Whether this is a worker process
+            use_gpu: Whether to use GPU for local computation
+            hidden_size: LSTM hidden size (must match global_model if provided)
+            num_layers: Number of LSTM layers (must match global_model if provided)
+            dropout: Dropout rate
+            use_layer_norm: Whether to use layer normalization
+        """
         if use_gpu and torch.cuda.is_available():
             self.device = torch.device('cuda')
         else:
             self.device = torch.device('cpu')
         
+        # If global_model is provided, infer architecture from it
+        if global_model is not None:
+            hidden_size = global_model.hidden_size
+            num_layers = global_model.num_layers
+            use_layer_norm = global_model._use_layer_norm
+            # Note: dropout is training-only, doesn't affect state_dict compatibility
+        
+        # Local network - must have SAME architecture as global model
         self.local_net = ActorCritic(
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -234,28 +239,24 @@ class ACAgent:
         self.optimizer = optimizer
         self.is_worker = is_worker
         
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
         self.hidden = None
         self.reset_hidden()
         
         self.name = "ACAgent"
         self.buffer: List[Transition] = []
-        self.batch_size = self.BATCH_SIZE
-        self.gamma = self.GAMMA
-        self.entropy_coef = self.ENTROPY_COEF
-        self.value_coef = self.VALUE_COEF
-        self.exploration_prob = self.EXPLORATION_PROB
+        self.batch_size = 64  # Smaller batch for more frequent updates, lager batch size for More stable gradient estimates.
+        self.gamma = 0.99
+        self.entropy_coef = 0.05  # Entropy bonus for exploration
+        self.value_coef = 0.5
+        self.max_grad_norm = 0.5
         
         if not is_worker and optimizer is None:
-            self.optimizer = optim.Adam(self.local_net.parameters(), lr=0.001, weight_decay=1e-5)
+            self.optimizer = optim.Adam(self.local_net.parameters(), lr=0.001)
 
     def reset_hidden(self):
-        """Reset LSTM hidden state."""
         self.hidden = (
-            torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device),
-            torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
+            torch.zeros(self.local_net.num_layers, 1, self.local_net.hidden_size, device=self.device),
+            torch.zeros(self.local_net.num_layers, 1, self.local_net.hidden_size, device=self.device)
         )
 
     def sync_local_to_global(self):
@@ -266,25 +267,17 @@ class ACAgent:
             self.local_net.load_state_dict(local_state_dict)
 
     def select_action(self, state: Dict, legal_actions: List[RummikubAction]) -> Tuple[RummikubAction, int, List[np.ndarray]]:
-        """Select action using policy with epsilon-greedy exploration."""
+        """Select action using policy. Returns (action, index, all_action_vecs)."""
         if not legal_actions:
             return RummikubAction(action_type='draw'), -1, []
         
         state_vec_np = get_state_vec(state)
         state_vec = torch.from_numpy(state_vec_np).to(self.device).unsqueeze(0).unsqueeze(0)
         
+        # Get action vectors for ALL legal actions
         action_vecs_np = [get_action_vec(a) for a in legal_actions]
         action_vecs = [torch.from_numpy(av).to(self.device) for av in action_vecs_np]
         
-        # Epsilon-greedy exploration
-        if np.random.random() < self.exploration_prob:
-            idx = np.random.randint(len(legal_actions))
-            with torch.no_grad():
-                _, _, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
-                self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
-            return legal_actions[idx], idx, action_vecs_np
-        
-        # Policy-based selection
         with torch.no_grad():
             _, logits_list, new_hidden = self.local_net(state_vec, [action_vecs], self.hidden)
             self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
@@ -294,32 +287,30 @@ class ACAgent:
         if logits is None or logits.numel() == 0:
             return RummikubAction(action_type='draw'), -1, []
         
+        # Sample from policy
         probs = F.softmax(logits, dim=0)
         dist = torch.distributions.Categorical(probs)
         idx = dist.sample().item()
         
         return legal_actions[idx], idx, action_vecs_np
 
-    def store_transition(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
-        """Store transition in buffer."""
-        trans = Transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
+    def learn(self, state_vec, action_idx, action_vecs, reward, next_state_vec, done, info, num_actions):
+        """Store transition and update if buffer full or episode done."""
+        trans = Transition(state_vec, action_idx, action_vecs, reward, next_state_vec, done, info, num_actions)
         self.buffer.append(trans)
-
-    def learn(self, state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions):
-        """Store transition and update when batch is full or episode ends."""
-        self.store_transition(state_vec, action_idx, action_vec, reward, next_state_vec, done, info, num_actions)
         
         if len(self.buffer) >= self.batch_size or done:
             self._update_global()
 
     def _update_global(self):
-        """Update global model using accumulated gradients."""
+        """Compute loss and update global model."""
         if not self.buffer or self.global_model is None:
             self.buffer = []
             return
         
         self.sync_local_to_global()
         
+        # Prepare data
         batch_size = len(self.buffer)
         
         state_vecs = np.stack([t.state_vec for t in self.buffer])
@@ -328,11 +319,11 @@ class ACAgent:
         
         state_vecs_t = torch.from_numpy(state_vecs).to(self.device).unsqueeze(1)
         
-        # Compute values (detached for TD target)
+        # Compute values for all states
         with torch.no_grad():
             values_detached, _ = self.local_net(state_vecs_t, None)
         
-        # Compute next values for TD target
+        # Compute next state values for TD target
         next_values = torch.zeros(batch_size, device=self.device)
         for i, trans in enumerate(self.buffer):
             if trans.next_state_vec is not None and not trans.done:
@@ -344,45 +335,53 @@ class ACAgent:
         # TD targets
         targets = rewards + self.gamma * next_values * (1 - dones)
         
-        # Advantages (normalized)
-        advantages = (targets - values_detached).detach()
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Compute values with gradient
+        # Compute values with gradient for critic loss
         values_with_grad, _ = self.local_net(state_vecs_t, None)
         
-        # Actor loss
+        # Advantages (standardize for stability)
+        advantages = (targets - values_detached).detach()
+        if advantages.numel() > 1 and advantages.std() > 1e-8:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Compute actor loss and entropy
         actor_loss = torch.tensor(0.0, device=self.device)
         entropy_loss = torch.tensor(0.0, device=self.device)
         num_actor_samples = 0
         
         for i, trans in enumerate(self.buffer):
-            if trans.action_idx is None or trans.action_idx < 0 or trans.action_vec is None:
+            # Skip transitions without valid actions (opponent turns, etc.)
+            if trans.action_idx is None or trans.action_idx < 0:
+                continue
+            if trans.action_vecs is None or len(trans.action_vecs) == 0:
                 continue
             if trans.num_actions <= 0:
                 continue
             
+            # Get logits for ALL legal actions (not just the selected one!)
             state_t = torch.from_numpy(trans.state_vec).to(self.device).unsqueeze(0).unsqueeze(0)
-            action_t = torch.from_numpy(trans.action_vec).to(self.device).unsqueeze(0)
+            action_vecs_t = [torch.from_numpy(av).to(self.device) for av in trans.action_vecs]
             
             temp_hidden = (
-                torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device),
-                torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
+                torch.zeros(self.local_net.num_layers, 1, self.local_net.hidden_size, device=self.device),
+                torch.zeros(self.local_net.num_layers, 1, self.local_net.hidden_size, device=self.device)
             )
             
-            _, logits_list, _ = self.local_net(state_t, [[action_t.squeeze(0)]], temp_hidden)
+            _, logits_list, _ = self.local_net(state_t, [action_vecs_t], temp_hidden)
             
             if logits_list[0] is not None and logits_list[0].numel() > 0:
-                log_probs = F.log_softmax(logits_list[0], dim=0)
-                probs = F.softmax(logits_list[0], dim=0)
+                logits = logits_list[0]
                 
-                log_prob = log_probs[0]
-                actor_loss = actor_loss - log_prob * advantages[i]
+                # Log probability of selected action
+                log_probs = F.log_softmax(logits, dim=0)
+                log_prob_selected = log_probs[trans.action_idx]
                 
-                # Entropy bonus
+                # Policy gradient loss
+                actor_loss = actor_loss - log_prob_selected * advantages[i]
+                
+                # Entropy bonus (encourages exploration)
+                probs = F.softmax(logits, dim=0)
                 entropy = -(probs * log_probs).sum()
-                entropy_loss = entropy_loss - entropy
+                entropy_loss = entropy_loss - entropy  # Negative because we minimize
                 
                 num_actor_samples += 1
         
@@ -396,14 +395,14 @@ class ACAgent:
         # Total loss
         loss = actor_loss + self.value_coef * critic_loss + self.entropy_coef * entropy_loss
         
-        # Backprop
+        # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
         
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(self.local_net.parameters(), self.max_grad_norm)
         
-        # Copy gradients to global model (GPU -> CPU)
+        # Copy gradients to global model
         for local_param, global_param in zip(self.local_net.parameters(), self.global_model.parameters()):
             if local_param.grad is not None:
                 cpu_grad = local_param.grad.cpu()
@@ -413,10 +412,11 @@ class ACAgent:
                     global_param.grad.copy_(cpu_grad)
         
         self.optimizer.step()
+        
         self.buffer = []
 
     def observe(self, state: Dict):
-        """Update LSTM hidden state by observing state (no action)."""
+        """Update LSTM hidden state by observing a state."""
         state_vec_np = get_state_vec(state)
         state_vec = torch.from_numpy(state_vec_np).to(self.device).unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
@@ -424,12 +424,10 @@ class ACAgent:
         self.hidden = (new_hidden[0].detach(), new_hidden[1].detach())
 
     def save(self, path: str):
-        """Save model to file."""
         model = self.global_model if self.global_model else self.local_net
         torch.save(model.state_dict(), path)
 
     def load(self, path: str):
-        """Load model from file."""
         model = self.global_model if self.global_model else self.local_net
         model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
         model.eval()
