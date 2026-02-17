@@ -1,6 +1,28 @@
+"""
+Rummikub Environment for Reinforcement Learning
+
+REWARD SYSTEM (v2 - No large constants):
+=========================================
+Intermediate Rewards (per turn):
+  - Base play: 2.0 × (hand_before - hand_after)
+  - Draw: 2.0 × (hand_before - hand_after) - 5.0
+  - Ice break bonus: +30.0 (one-time)
+  - Manipulation bonus: +10.0
+  - NEW: 4+ tiles bonus: +5.0
+  - NEW: Extension bonus: +3.0
+  - NEW: Large hand penalty: -2.0 (if 20+ tiles)
+
+Terminal Rewards (game end - NO LARGE CONSTANTS):
+  - Win by empty hand: +opponent_hand_value
+  - Lose by opponent empty: -agent_hand_value
+  - Pool empty (lower hand wins): winner gets +(loser_hand - winner_hand)
+  - Pool empty (higher hand loses): loser gets -(loser_hand - winner_hand)
+  - Equal hands: 0
+"""
+
 import numpy as np
 from typing import List, Tuple, Set, Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import copy
 
@@ -91,16 +113,20 @@ class TileSet:
             return False
         if len(numbers) > 0:
             numbers.sort()
-            min_num, max_num = numbers[0], numbers[-1]
-            internal_missing = (max_num - min_num + 1) - len(numbers)
+            min_num = numbers[0]
+            max_num = numbers[-1]
+            expected_length = max_num - min_num + 1
+            internal_missing = expected_length - len(numbers)
             if internal_missing > joker_count:
                 return False
         return True
     
     def get_value(self) -> int:
+        """Returns the total value of tiles (jokers count as 0)"""
         return sum(t.number for t in self.tiles if t.tile_type != TileType.JOKER)
     
     def get_meld_value(self) -> int:
+        """Returns value for initial meld (jokers take represented value)"""
         if self.set_type == "group":
             non_joker = [t for t in self.tiles if t.tile_type != TileType.JOKER]
             if non_joker:
@@ -111,70 +137,46 @@ class TileSet:
                               key=lambda t: t.number)
             if non_joker:
                 min_num = non_joker[0].number
-                jokers_before = sum(1 for t in self.tiles[:self.tiles.index(non_joker[0])] 
-                                   if t.tile_type == TileType.JOKER)
-                actual_min = min_num - jokers_before
-                return sum(range(actual_min, actual_min + len(self.tiles)))
+                return sum(range(min_num, min_num + len(self.tiles)))
             return 0
         return 0
 
 
+@dataclass 
 class RummikubAction:
-    def __init__(self, action_type: str, tiles: List[Tile] = None, 
-                 sets: List[TileSet] = None, table_config: List[TileSet] = None):
-        self.action_type = action_type
-        self.tiles = tiles or []
-        self.sets = sets or []
-        self.table_config = table_config
+    """
+    Represents an action in Rummikub.
+    
+    Enhanced with metadata for RL features:
+    - set_types: List of set types being formed ('run', 'group')
+    - is_extension: Whether this extends existing table sets
+    - meld_value: Total value of the meld being created
+    """
+    action_type: str  # 'draw', 'initial_meld', 'play'
+    tiles: List[Tile] = field(default_factory=list)
+    sets: List[TileSet] = field(default_factory=list)
+    table_config: Optional[List[TileSet]] = None
+    # Enhanced metadata for RL
+    set_types: List[str] = field(default_factory=list)  # ['run', 'group', ...]
+    is_extension: bool = False  # True if extends existing sets
+    meld_value: int = 0  # Total value of meld
 
 
 class RummikubEnv:
     """
-    Rummikub Environment with ALL reward logic.
+    Rummikub Environment for Reinforcement Learning
     
-    REWARD CONFIGURATION (class variables):
-        REWARD_BASE_MULTIPLIER = 2.0
-        REWARD_ICE_BREAK = 30.0
-        REWARD_MANIPULATION = 10.0
-        REWARD_DRAW_PENALTY = -5.0
-        REWARD_WIN_EMPTY_HAND = 300.0
-        REWARD_WIN_LOWEST_HAND = 50.0
-        REWARD_LOSE_EMPTY_HAND = -200.0
-        REWARD_LOSE_LOWEST_HAND = -75.0
-    
-    REWARD FORMULA:
-        Acting player's turn (play/meld):
-            intermediate = BASE_MULTIPLIER * (hand_before - hand_after) + bonuses
-        
-        Acting player's turn (draw):
-            intermediate = BASE_MULTIPLIER * (hand_before - hand_after) + DRAW_PENALTY
-        
-        Terminal (acting player wins by empty hand):
-            acting_player_reward = intermediate + WIN_EMPTY_HAND + opponent_hand
-            opponent_reward = LOSE_EMPTY_HAND - opponent_hand  # ALWAYS < -200
-        
-        Terminal (acting player wins by lowest hand):
-            acting_player_reward = intermediate + WIN_LOWEST_HAND
-            opponent_reward = LOSE_LOWEST_HAND
-    
-    The step() function returns rewards for BOTH players:
-        info['reward_for_player_0']
-        info['reward_for_player_1']
-    
-    Use info['reward_for_player_{your_player_index}'] to get your reward.
+    REWARD PARAMETERS (v2 - balanced scale, no large constants):
     """
-    
-    # =========================================================================
-    # REWARD CONFIGURATION - All reward params in ONE place
-    # =========================================================================
+    # Intermediate reward parameters
     REWARD_BASE_MULTIPLIER = 2.0
     REWARD_ICE_BREAK = 30.0
     REWARD_MANIPULATION = 10.0
     REWARD_DRAW_PENALTY = -5.0
-    REWARD_WIN_EMPTY_HAND = 300.0
-    REWARD_WIN_LOWEST_HAND = 50.0
-    REWARD_LOSE_EMPTY_HAND = -200.0
-    REWARD_LOSE_LOWEST_HAND = -75.0
+    REWARD_TILES_4_PLUS = 5.0         # NEW: Bonus for playing 4+ tiles
+    REWARD_EXTENSION = 3.0            # NEW: Bonus for extending existing set
+    REWARD_LARGE_HAND_PENALTY = -2.0  # NEW: Penalty per turn if 20+ tiles
+    LARGE_HAND_THRESHOLD = 20         # NEW: Threshold for large hand penalty
     
     def __init__(self, seed: Optional[int] = None):
         self.rng = np.random.RandomState(seed)
@@ -191,15 +193,20 @@ class RummikubEnv:
         self._initialize_deck()
     
     def _initialize_deck(self):
+        """Create the full deck of 106 tiles"""
         self.tiles_deck = []
         tile_id = 0
-        for _ in range(2):
+        for copy in range(2):
             for color in Color:
                 for number in range(1, 14):
-                    self.tiles_deck.append(Tile(color, number, TileType.NORMAL, tile_id))
+                    tile = Tile(color=color, number=number, 
+                                tile_type=TileType.NORMAL, tile_id=tile_id)
+                    self.tiles_deck.append(tile)
                     tile_id += 1
         for _ in range(2):
-            self.tiles_deck.append(Tile(None, None, TileType.JOKER, tile_id))
+            tile = Tile(color=None, number=None, 
+                        tile_type=TileType.JOKER, tile_id=tile_id)
+            self.tiles_deck.append(tile)
             tile_id += 1
     
     def reset(self) -> Dict:
@@ -209,7 +216,8 @@ class RummikubEnv:
         self.player_hands = [[], []]
         for player in range(2):
             for _ in range(14):
-                self.player_hands[player].append(self.tiles_deck.pop())
+                tile = self.tiles_deck.pop()
+                self.player_hands[player].append(tile)
         self.table = []
         self.current_player = self.rng.choice([0, 1])
         self.has_melded = [False, False]
@@ -223,9 +231,10 @@ class RummikubEnv:
         return sum(t.get_value() for t in self.player_hands[player_id])
     
     def _count_jokers_in_hand(self, player: int) -> int:
-        return sum(1 for t in self.player_hands[player] if t.tile_type == TileType.JOKER)
+        return sum(1 for tile in self.player_hands[player] if tile.tile_type == TileType.JOKER)
     
     def _get_state(self) -> Dict:
+        """Return the current game state"""
         return {
             'my_hand': copy.deepcopy(self.player_hands[self.current_player]),
             'table': copy.deepcopy(self.table),
@@ -239,18 +248,20 @@ class RummikubEnv:
         }
     
     def get_legal_actions(self, player: int) -> List[RummikubAction]:
+        """Get all legal actions for the specified player."""
         if self.action_generator is None:
             raise ValueError("Action generator not set")
         
-        all_ids = [t.tile_id for ts in self.table for t in ts.tiles]
-        if len(all_ids) != len(set(all_ids)):
+        all_table_tile_ids = [t.tile_id for ts in self.table for t in ts.tiles]
+        if len(all_table_tile_ids) != len(set(all_table_tile_ids)):
             if len(self.tiles_deck) > 0:
                 return [RummikubAction(action_type='draw')]
             return []
         
+        table_copy = copy.deepcopy(self.table)
         actions = self.action_generator.generate_all_legal_actions(
             hand_tiles=self.player_hands[player],
-            table_sets=copy.deepcopy(self.table),
+            table_sets=table_copy,
             has_melded=self.has_melded[player],
             pool_size=len(self.tiles_deck)
         )
@@ -262,20 +273,18 @@ class RummikubEnv:
     
     def step(self, action: RummikubAction) -> Tuple[Dict, float, bool, Dict]:
         """
-        Execute action and return (state, reward, done, info).
+        Execute an action and return (state, reward, done, info)
         
-        The 'reward' returned is from the ACTING PLAYER's perspective.
-        
-        CRITICAL: Use info['reward_for_player_X'] where X is YOUR player index
-        to get the correct reward for your agent.
+        Rewards are computed for BOTH players and returned in info dict.
         """
         if self.game_over:
             raise ValueError("Game is already over")
         
         acting_player = self.current_player
         opponent = 1 - acting_player
+        
         hand_value_before = self._calculate_hand_value(acting_player)
-        had_melded_before = self.has_melded[acting_player]
+        hand_size_before = len(self.player_hands[acting_player])
         
         info = {
             'action_type': action.action_type,
@@ -283,24 +292,25 @@ class RummikubEnv:
             'drew_tile': False,
             'ice_broken': False,
             'manipulation_occurred': False,
+            'is_extension': action.is_extension,
             'invalid_action': False,
-            'hand_size_before': len(self.player_hands[acting_player]),
+            'hand_size_before': hand_size_before,
             'hand_value_before': hand_value_before,
-            'acting_player': acting_player,
         }
         
         # Execute action
         if action.action_type == 'draw':
             if len(self.tiles_deck) > 0:
-                self.player_hands[acting_player].append(self.tiles_deck.pop(0))
+                drawn_tile = self.tiles_deck.pop(0)
+                self.player_hands[acting_player].append(drawn_tile)
                 info['drew_tile'] = True
             else:
                 info['invalid_action'] = True
-        
+                
         elif action.action_type == 'initial_meld':
             if action.sets:
-                all_ids = [t.tile_id for s in action.sets for t in s.tiles]
-                if len(all_ids) != len(set(all_ids)):
+                all_set_tile_ids = [t.tile_id for s in action.sets for t in s.tiles]
+                if len(all_set_tile_ids) != len(set(all_set_tile_ids)):
                     info['invalid_action'] = True
             
             if not info.get('invalid_action') and self._validate_initial_meld(action):
@@ -310,47 +320,66 @@ class RummikubEnv:
                 info['tiles_played'] = len(action.tiles)
             else:
                 info['invalid_action'] = True
-        
+                
         elif action.action_type == 'play':
             if action.table_config:
-                all_ids = [t.tile_id for s in action.table_config for t in s.tiles]
-                if len(all_ids) != len(set(all_ids)):
+                all_config_tile_ids = [t.tile_id for s in action.table_config for t in s.tiles]
+                if len(all_config_tile_ids) != len(set(all_config_tile_ids)):
                     info['invalid_action'] = True
             
             if not info.get('invalid_action') and self._validate_play(action):
                 info['tiles_played'] = len(action.tiles)
-                if len(action.table_config) != len(self.table) + len(action.sets or []):
+                # Check if manipulation occurred
+                if action.table_config and len(action.table_config) != len(self.table) + len(action.sets or []):
                     info['manipulation_occurred'] = True
                 self._apply_play(action)
             else:
                 info['invalid_action'] = True
         
+        # Calculate values after action
         hand_value_after = self._calculate_hand_value(acting_player)
+        hand_size_after = len(self.player_hands[acting_player])
         info['hand_value_after'] = hand_value_after
-        info['hand_size_after'] = len(self.player_hands[acting_player])
+        info['hand_size_after'] = hand_size_after
         
         # =====================================================================
-        # REWARD CALCULATION - ALL LOGIC HERE
+        # COMPUTE REWARDS FOR BOTH PLAYERS
         # =====================================================================
-        reward_for_player = [0.0, 0.0]
-        done = False
+        reward_acting = 0.0
+        reward_opponent = 0.0
         
-        # Compute intermediate reward for acting player
         if not info['invalid_action']:
+            # Intermediate reward for acting player
             hand_change = hand_value_before - hand_value_after
             intermediate = self.REWARD_BASE_MULTIPLIER * hand_change
             
             if action.action_type == 'draw':
                 intermediate += self.REWARD_DRAW_PENALTY
             else:
-                if info['ice_broken'] and not had_melded_before:
+                if info.get('ice_broken'):
                     intermediate += self.REWARD_ICE_BREAK
-                if info['manipulation_occurred']:
+                if info.get('manipulation_occurred'):
                     intermediate += self.REWARD_MANIPULATION
+                
+                # NEW: Bonus for playing 4+ tiles
+                if info['tiles_played'] >= 4:
+                    intermediate += self.REWARD_TILES_4_PLUS
+                
+                # NEW: Bonus for extension
+                if action.is_extension:
+                    intermediate += self.REWARD_EXTENSION
             
-            reward_for_player[acting_player] = intermediate
+            # NEW: Penalty for large hand (20+ tiles)
+            if hand_size_after >= self.LARGE_HAND_THRESHOLD:
+                intermediate += self.REWARD_LARGE_HAND_PENALTY
+            
+            reward_acting = intermediate
+            reward_opponent = 0.0  # Opponent gets no intermediate reward
         
-        # Check termination: acting player emptied hand
+        # Check termination
+        done = False
+        
+        # Win by empty hand
         if len(self.player_hands[acting_player]) == 0:
             self.game_over = True
             self.winner = acting_player
@@ -358,136 +387,166 @@ class RummikubEnv:
             
             opponent_hand_value = self._calculate_hand_value(opponent)
             
+            # Terminal rewards (NO LARGE CONSTANTS!)
+            # Winner gets opponent's hand value
+            # Loser gets negative of opponent's hand value
+            terminal_acting = opponent_hand_value
+            terminal_opponent = -opponent_hand_value
+            
+            reward_acting += terminal_acting
+            reward_opponent = terminal_opponent
+            
             info['final_my_hand_value'] = 0
             info['final_opponent_hand_value'] = opponent_hand_value
             info['win_type'] = 'emptied_hand'
             info['winner'] = acting_player
-            
-            # Winner (acting player): intermediate + terminal
-            winner_terminal = self.REWARD_WIN_EMPTY_HAND + opponent_hand_value
-            reward_for_player[acting_player] += winner_terminal
-            
-            # Loser (opponent): ONLY terminal, no intermediate
-            # This is ALWAYS < REWARD_LOSE_EMPTY_HAND since opponent_hand_value > 0
-            loser_terminal = self.REWARD_LOSE_EMPTY_HAND - opponent_hand_value
-            reward_for_player[opponent] = loser_terminal
+            info['terminal_reward'] = terminal_acting
         
-        # Check termination: pool empty, no one can play
+        # Pool empty - check if game should end
         elif len(self.tiles_deck) == 0:
-            current_can = len(self.get_legal_actions(acting_player)) > 0
+            # Check if anyone can play
+            current_can_play = any(a.action_type != 'draw' for a in self.get_legal_actions(acting_player))
             
-            temp = self.current_player
+            temp_current = self.current_player
             self.current_player = opponent
-            next_can = len(self.get_legal_actions(opponent)) > 0
-            self.current_player = temp
+            next_can_play = any(a.action_type != 'draw' for a in self.get_legal_actions(opponent))
+            self.current_player = temp_current
             
-            if not current_can and not next_can:
+            if not current_can_play and not next_can_play:
                 self.game_over = True
                 done = True
                 
-                p0_hand = self._calculate_hand_value(0)
-                p1_hand = self._calculate_hand_value(1)
+                acting_value = self._calculate_hand_value(acting_player)
+                opponent_value = self._calculate_hand_value(opponent)
                 
-                info['final_my_hand_value'] = self._calculate_hand_value(acting_player)
-                info['final_opponent_hand_value'] = self._calculate_hand_value(opponent)
-                info['jokers_in_hand'] = self._count_jokers_in_hand(acting_player)
+                info['final_my_hand_value'] = acting_value
+                info['final_opponent_hand_value'] = opponent_value
                 
-                if p0_hand < p1_hand:
-                    self.winner = 0
+                # Determine winner by lowest hand value
+                if acting_value < opponent_value:
+                    # Acting player wins
+                    self.winner = acting_player
+                    difference = opponent_value - acting_value
+                    reward_acting += difference
+                    reward_opponent = -difference
                     info['win_type'] = 'lowest_hand'
-                    info['winner'] = 0
-                    reward_for_player[0] += self.REWARD_WIN_LOWEST_HAND
-                    reward_for_player[1] = self.REWARD_LOSE_LOWEST_HAND
-                elif p1_hand < p0_hand:
-                    self.winner = 1
+                    info['winner'] = acting_player
+                    info['terminal_reward'] = difference
+                elif opponent_value < acting_value:
+                    # Opponent wins
+                    self.winner = opponent
+                    difference = acting_value - opponent_value
+                    reward_acting += -difference
+                    reward_opponent = difference
                     info['win_type'] = 'lowest_hand'
-                    info['winner'] = 1
-                    reward_for_player[1] += self.REWARD_WIN_LOWEST_HAND
-                    reward_for_player[0] = self.REWARD_LOSE_LOWEST_HAND
+                    info['winner'] = opponent
+                    info['terminal_reward'] = -difference
                 else:
+                    # Tie - equal hands, no winner
                     self.winner = None
+                    reward_acting += 0
+                    reward_opponent = 0
                     info['win_type'] = 'tie'
                     info['winner'] = None
+                    info['terminal_reward'] = 0
         
-        # CRITICAL: Store rewards for BOTH players
-        info['reward_for_player_0'] = reward_for_player[0]
-        info['reward_for_player_1'] = reward_for_player[1]
+        # Store rewards in info for both players
+        info[f'reward_for_player_{acting_player}'] = reward_acting
+        info[f'reward_for_player_{opponent}'] = reward_opponent
         
-        # Return reward from acting player's perspective (for compatibility)
-        reward = reward_for_player[acting_player]
-        
+        # Update state
         self.previous_hand_values[acting_player] = hand_value_after
         
         if not done:
-            self.current_player = 1 - self.current_player
+            self.current_player = opponent
             self.turn_count += 1
         
-        return self._get_state(), reward, done, info
+        return self._get_state(), reward_acting, done, info
     
     def _validate_initial_meld(self, action: RummikubAction) -> bool:
+        """Validate that initial meld is legal (30+ points)"""
         if not action.sets:
             return False
-        total = sum(s.get_meld_value() for s in action.sets)
-        valid = all(s.is_valid() for s in action.sets)
-        in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
-        return total >= 30 and valid and in_hand
+        total_value = sum(s.get_meld_value() for s in action.sets)
+        all_valid = all(s.is_valid() for s in action.sets)
+        all_tiles_in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
+        return total_value >= 30 and all_valid and all_tiles_in_hand
     
     def _validate_play(self, action: RummikubAction) -> bool:
+        """Validate that a play is legal"""
         if action.table_config is None:
             return False
-        in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
-        valid = all(s.is_valid() for s in action.table_config)
+        
+        all_tiles_in_hand = all(t in self.player_hands[self.current_player] for t in action.tiles)
+        all_sets_valid = all(s.is_valid() for s in action.table_config)
         
         table_tiles = [t for ts in self.table for t in ts.tiles]
-        new_tiles = [t for ts in action.table_config for t in ts.tiles]
-        new_ids = [t.tile_id for t in new_tiles]
+        new_table_tiles = [t for ts in action.table_config for t in ts.tiles]
         
-        if len(new_ids) != len(set(new_ids)):
+        new_table_tile_ids = [t.tile_id for t in new_table_tiles]
+        if len(new_table_tile_ids) != len(set(new_table_tile_ids)):
             return False
         
-        expected = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
-        actual = set(new_ids)
+        expected_tile_ids = set(t.tile_id for t in table_tiles) | set(t.tile_id for t in action.tiles)
+        actual_tile_ids = set(new_table_tile_ids)
         
-        return in_hand and valid and expected == actual
+        return all_tiles_in_hand and all_sets_valid and expected_tile_ids == actual_tile_ids
     
     def _apply_meld(self, action: RummikubAction):
-        for t in action.tiles:
-            self.player_hands[self.current_player].remove(t)
+        """Apply initial meld to game state"""
+        for tile in action.tiles:
+            self.player_hands[self.current_player].remove(tile)
         self.table.extend(copy.deepcopy(action.sets))
         self._validate_table_integrity()
     
     def _apply_play(self, action: RummikubAction):
-        for t in action.tiles:
-            self.player_hands[self.current_player].remove(t)
+        """Apply a play to game state"""
+        for tile in action.tiles:
+            self.player_hands[self.current_player].remove(tile)
         self.table = copy.deepcopy(action.table_config)
         self._validate_table_integrity()
     
     def _validate_table_integrity(self):
-        all_ids = [t.tile_id for ts in self.table for t in ts.tiles]
-        if len(all_ids) != len(set(all_ids)):
+        """Ensure no tile appears multiple times on the table"""
+        all_tile_ids = [t.tile_id for ts in self.table for t in ts.tiles]
+        if len(all_tile_ids) != len(set(all_tile_ids)):
             from collections import Counter
-            dups = {k: v for k, v in Counter(all_ids).items() if v > 1}
-            raise ValueError(f"Table corruption: {dups}")
+            counts = Counter(all_tile_ids)
+            duplicates = {tid: cnt for tid, cnt in counts.items() if cnt > 1}
+            raise ValueError(f"Table corruption: duplicate tile_ids {duplicates}")
     
     def render(self):
+        """Print the current game state"""
         print(f"\n{'='*60}")
         print(f"Turn {self.turn_count} - Player {self.current_player}'s turn")
         print(f"{'='*60}")
+        
         for i, hand in enumerate(self.player_hands):
-            val = self._calculate_hand_value(i)
+            value = self._calculate_hand_value(i)
+            print(f"\nPlayer {i} hand ({len(hand)} tiles, value={value}): ", end="")
             if i == self.current_player:
-                print(f"Player {i} ({len(hand)} tiles, val={val}): {[str(t) for t in hand]}")
+                print([str(t) for t in hand])
             else:
-                print(f"Player {i} ({len(hand)} tiles, val={val}): [hidden]")
-        print(f"Table: {len(self.table)} sets")
-        print(f"Pool: {len(self.tiles_deck)} | Melded: {self.has_melded}")
+                print(f"[{len(hand)} hidden tiles]")
+        
+        print(f"\nTable ({len(self.table)} sets):")
+        for i, tile_set in enumerate(self.table):
+            print(f"  Set {i+1} ({tile_set.set_type}): {[str(t) for t in tile_set.tiles]}")
+        
+        print(f"\nPool: {len(self.tiles_deck)} tiles remaining")
+        print(f"Melded: P0={self.has_melded[0]}, P1={self.has_melded[1]}")
+        
+        if self.game_over:
+            print(f"\n{'='*60}")
+            if self.winner is not None:
+                print(f"GAME OVER! Winner: Player {self.winner}")
+            else:
+                print(f"GAME OVER! Tie!")
+            print(f"{'='*60}")
 
 
 if __name__ == "__main__":
-    # Quick test
     env = RummikubEnv(seed=42)
-    print("Reward configuration:")
-    print(f"  LOSE_EMPTY_HAND = {env.REWARD_LOSE_EMPTY_HAND}")
-    print(f"  When opponent wins with agent having 150 in hand:")
-    print(f"  Agent reward = {env.REWARD_LOSE_EMPTY_HAND} - 150 = {env.REWARD_LOSE_EMPTY_HAND - 150}")
-    print(f"  This is ALWAYS < {env.REWARD_LOSE_EMPTY_HAND}")
+    state = env.reset()
+    print("Initial state:")
+    env.render()

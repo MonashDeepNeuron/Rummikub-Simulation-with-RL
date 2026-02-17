@@ -32,7 +32,12 @@ class RummikubILPSolver:
     ILP-based Rummikub solver that finds optimal plays.
     """
     
-    def __init__(self):
+    def __init__(self, timeout: float = 5.0):
+        """
+        Args:
+            timeout: Maximum time in seconds for ILP solver
+        """
+        self.timeout = timeout
         self.all_melds = self._generate_all_possible_melds()
     
     def _generate_all_possible_melds(self) -> List[PossibleMeld]:
@@ -80,6 +85,9 @@ class RummikubILPSolver:
         solver = pywraplp.Solver.CreateSolver('CBC')
         if not solver:
             return None
+        
+        # Set timeout
+        solver.SetTimeLimit(int(self.timeout * 1000))  # Convert to milliseconds
         
         # ===== STEP 1: Collect and validate input tiles =====
         table_tiles: List[Tile] = []
