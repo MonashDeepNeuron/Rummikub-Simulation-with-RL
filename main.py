@@ -62,6 +62,9 @@ class Config:
     BATCH_SIZE = 64
     GRAD_CLIP = 0.5
     
+    # GPU optimization
+    USE_AMP = False  # Automatic Mixed Precision (set True for faster training on modern GPUs)
+    
     # Timeout parameters
     MAX_TURNS = 150
     ACTION_GEN_TIMEOUT = 10.0      # Passed to ActionGenerator (internal timeout)
@@ -325,7 +328,8 @@ def worker_process(worker_id, global_model, optimizer, num_episodes, config, sta
         value_coef=Config.VALUE_COEF,
         batch_size=Config.BATCH_SIZE,
         grad_clip=Config.GRAD_CLIP,
-        exploration_prob=Config.EXPLORATION_PROB
+        exploration_prob=Config.EXPLORATION_PROB,
+        use_amp=Config.USE_AMP
     )
     
     print(f"{prefix} Starting on {agent.device}...")
@@ -557,7 +561,7 @@ def save_reward_plot(rewards, terminal_rewards, filename='training_rewards.png')
     ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     ax3.set_xlabel('Episode')
     ax3.set_ylabel('Terminal Reward')
-    ax3.set_title('Terminal Rewards (No Large Constants)')
+    ax3.set_title('Terminal Rewards Over Episodes')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     
@@ -576,7 +580,7 @@ def save_reward_plot(rewards, terminal_rewards, filename='training_rewards.png')
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
     plt.close()
-    print(f"Saved reward plot to {filename}")
+    print(f"Saved reward plot to {filename} | [{get_timestamp()}]")
 
 
 def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoint_path=None):
@@ -631,6 +635,7 @@ def train_a3c(num_workers=4, num_episodes_per_worker=500, config=None, checkpoin
           f"dropout={Config.DROPOUT}, layer_norm={Config.USE_LAYER_NORM}")
     print(f"Training: lr={Config.LEARNING_RATE}, gamma={Config.GAMMA}, "
           f"entropy={Config.ENTROPY_COEF}, batch={Config.BATCH_SIZE}")
+    print(f"GPU: use_amp={Config.USE_AMP}")
     print(f"Timeouts: max_turns={Config.MAX_TURNS}, action_gen={Config.ACTION_GEN_TIMEOUT}s, "
           f"opponent={Config.OPPONENT_TIMEOUT}s, episode={Config.MAX_EPISODE_TIME}s")
     print(f"Action Gen: mode={Config.ACTION_GEN_MODE.value}, ilp_calls={Config.MAX_ILP_CALLS}, "
